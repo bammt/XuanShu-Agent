@@ -1,0 +1,7 @@
+{
+  "name": "execute_python",
+  "kind": "platform_executor",
+  "description": "Run ad hoc Python in the isolated application workspace.",
+  "working_directory": "workspace",
+  "network_access": true
+}

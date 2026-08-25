@@ -1,0 +1,13 @@
+.env
+__pycache__/
+.venv/
+.pytest_cache/
+.artifacts/
+frontend/node_modules/
+frontend/dist/
+*.py[cod]
+*.sqlite*
+lib/
+.DS_Store
+data/*
+!data/README.md

@@ -1,0 +1,37 @@
+# Development overlay. It keeps the dependency images and named data volumes
+# from docker-compose.yml, while source changes are used after a restart.
+services:
+  schema-init:
+    volumes:
+      - ./src:/app/src:ro
+
+  backend:
+    volumes:
+      - ./src:/app/src:ro
+
+  worker:
+    volumes:
+      - ./src:/app/src:ro
+      - ./worker/worker.py:/app/worker.py:ro
+      - ./worker/studio_worker.py:/app/studio_worker.py:ro
+
+  studio-worker:
+    volumes:
+      - ./src:/app/src:ro
+      - ./worker/worker.py:/app/worker.py:ro
+      - ./worker/studio_worker.py:/app/studio_worker.py:ro
+
+  executor:
+    volumes:
+      - ./executor/app.py:/app/app.py:ro
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile.dev
+    environment:
+      VITE_API_PROXY: http://backend:8012
+    command: [sh, -c, "npm ci --no-audit --no-fund && npm run dev -- --host 0.0.0.0 --port 80"]
+    volumes:
+      - ./frontend:/app
+      - ./data/frontend-node-modules:/app/node_modules

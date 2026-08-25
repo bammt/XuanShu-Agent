@@ -1,0 +1,104 @@
+services:
+  data-init:
+    image: busybox:1.37
+    command: [sh, -c, 'mkdir -p /data/postgres /data/redis /data/minio /data/qdrant /data/workspaces && rm -f /data/postgres/.gitkeep /data/redis/.gitkeep /data/minio/.gitkeep /data/qdrant/.gitkeep /data/workspaces/.gitkeep && chmod 0770 /data /data/postgres /data/redis /data/minio /data/qdrant /data/workspaces']
+    volumes: [./data:/data]
+    restart: 'no'
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes: [./data/postgres:/var/lib/postgresql/data]
+    depends_on: { data-init: { condition: service_completed_successfully } }
+    healthcheck: { test: [CMD-SHELL, 'pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}'], interval: 5s, timeout: 5s, retries: 10 }
+    restart: unless-stopped
+  redis:
+    image: redis:7-alpine
+    volumes: [./data/redis:/data]
+    depends_on: { data-init: { condition: service_completed_successfully } }
+    healthcheck: { test: [CMD, redis-cli, ping], interval: 5s, timeout: 3s, retries: 10 }
+    restart: unless-stopped
+  minio:
+    image: minio/minio:RELEASE.2025-07-23T15-54-02Z
+    command: ["server", "/data", "--console-address", ":9001"]
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ACCESS_KEY}
+      MINIO_ROOT_PASSWORD: ${MINIO_SECRET_KEY}
+    volumes: [./data/minio:/data]
+    depends_on: { data-init: { condition: service_completed_successfully } }
+    healthcheck: { test: [CMD, curl, -f, http://127.0.0.1:9000/minio/health/live], interval: 5s, timeout: 3s, retries: 12 }
+    restart: unless-stopped
+  qdrant:
+    image: qdrant/qdrant:v1.15.4
+    volumes: [./data/qdrant:/qdrant/storage]
+    depends_on: { data-init: { condition: service_completed_successfully } }
+    healthcheck: { test: [CMD-SHELL, 'bash -c ": > /dev/tcp/127.0.0.1/6333"'], interval: 5s, timeout: 3s, retries: 12 }
+    restart: unless-stopped
+  workspace-init:
+    image: busybox:1.37
+    command: [sh, -c, 'mkdir -p /var/lib/xuanshu/workspaces && chown -R 10001:10001 /var/lib/xuanshu/workspaces']
+    volumes: [./data/workspaces:/var/lib/xuanshu/workspaces]
+    depends_on: { data-init: { condition: service_completed_successfully } }
+    restart: 'no'
+  schema-init:
+    build: { context: ., dockerfile: Dockerfile.backend }
+    command: [.venv/bin/python, -m, xuanshu_platform.bootstrap]
+    env_file: .env
+    depends_on: { data-init: { condition: service_completed_successfully }, postgres: { condition: service_healthy }, workspace-init: { condition: service_completed_successfully } }
+    volumes: [./data/workspaces:/var/lib/xuanshu/workspaces]
+    restart: 'no'
+  backend:
+    build: { context: ., dockerfile: Dockerfile.backend }
+    env_file: .env
+    ports: ['${BACKEND_PORT}:8012']
+    depends_on: { postgres: { condition: service_healthy }, redis: { condition: service_healthy }, minio: { condition: service_healthy }, qdrant: { condition: service_healthy }, executor: { condition: service_healthy }, workspace-init: { condition: service_completed_successfully }, schema-init: { condition: service_completed_successfully } }
+    volumes: [./data/workspaces:/var/lib/xuanshu/workspaces]
+    healthcheck: { test: [CMD, .venv/bin/python, -c, "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8012/api/health')"], interval: 5s, timeout: 3s, retries: 12, start_period: 10s }
+    restart: unless-stopped
+  worker:
+    build: { context: ., dockerfile: worker/Dockerfile }
+    env_file: .env
+    environment:
+      WORKFLOW_WORKER_CONCURRENCY: ${WORKFLOW_WORKER_CONCURRENCY:-8}
+      KNOWLEDGE_WORKER_CONCURRENCY: ${KNOWLEDGE_WORKER_CONCURRENCY:-2}
+    depends_on: { postgres: { condition: service_healthy }, redis: { condition: service_healthy }, minio: { condition: service_healthy }, qdrant: { condition: service_healthy }, executor: { condition: service_healthy }, workspace-init: { condition: service_completed_successfully }, schema-init: { condition: service_completed_successfully } }
+    volumes: [./data/workspaces:/var/lib/xuanshu/workspaces]
+    healthcheck: { test: [CMD, .venv/bin/python, -c, "import os; os.kill(1, 0)"], interval: 10s, timeout: 3s, retries: 5 }
+    restart: unless-stopped
+  studio-worker:
+    build: { context: ., dockerfile: worker/Dockerfile }
+    command: [.venv/bin/python, studio_worker.py]
+    env_file: .env
+    environment:
+      STUDIO_WORKER_CONCURRENCY: ${STUDIO_WORKER_CONCURRENCY:-4}
+      STUDIO_SESSION_LOCK_SECONDS: ${STUDIO_SESSION_LOCK_SECONDS:-3600}
+    depends_on: { postgres: { condition: service_healthy }, redis: { condition: service_healthy }, minio: { condition: service_healthy }, qdrant: { condition: service_healthy }, executor: { condition: service_healthy }, workspace-init: { condition: service_completed_successfully }, schema-init: { condition: service_completed_successfully } }
+    volumes: [./data/workspaces:/var/lib/xuanshu/workspaces]
+    healthcheck: { test: [CMD, .venv/bin/python, -c, "import os; os.kill(1, 0)"], interval: 10s, timeout: 3s, retries: 5 }
+    restart: unless-stopped
+  executor:
+    build: { context: ./executor, dockerfile: Dockerfile }
+    environment:
+      CODE_TIMEOUT_SECONDS: ${CODE_TIMEOUT_SECONDS}
+      EXECUTOR_SHARED_SECRET: ${EXECUTOR_SHARED_SECRET}
+      EXECUTOR_MAX_SNAPSHOT_MB: ${EXECUTOR_MAX_SNAPSHOT_MB:-50}
+      EXECUTOR_WORK_ROOT: /var/lib/xuanshu/workspaces
+    volumes: [./data/workspaces:/var/lib/xuanshu/workspaces]
+    read_only: true
+    tmpfs: [/tmp:size=128m]
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    mem_limit: 1g
+    cpus: 1.0
+    pids_limit: 128
+    healthcheck: { test: [CMD, python, -c, "import json,urllib.request; assert json.load(urllib.request.urlopen('http://127.0.0.1:8020/health'))['status']=='ok'"], interval: 5s, timeout: 3s, retries: 12 }
+    restart: unless-stopped
+  frontend:
+    build: { context: ./frontend, dockerfile: Dockerfile }
+    ports: ['${FRONTEND_PORT}:80']
+    environment: { NGINX_MAX_UPLOAD: '${MAX_UPLOAD_MB}m', NGINX_ENVSUBST_FILTER: 'NGINX_MAX_UPLOAD' }
+    depends_on: { backend: { condition: service_healthy } }
+    healthcheck: { test: [CMD, wget, -qO-, http://127.0.0.1/api/health], interval: 5s, timeout: 3s, retries: 12 }
+    restart: unless-stopped

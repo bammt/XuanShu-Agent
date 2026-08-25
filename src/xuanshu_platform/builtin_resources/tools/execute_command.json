@@ -1,0 +1,7 @@
+{
+  "name": "execute_command",
+  "kind": "platform_executor",
+  "description": "Run a shell command in the isolated application workspace.",
+  "working_directory": "workspace",
+  "network_access": true
+}

@@ -1,0 +1,6 @@
+{
+  "name": "read_document",
+  "kind": "platform",
+  "description": "Read DOCX or PDF content from the application workspace.",
+  "working_directory": "workspace"
+}

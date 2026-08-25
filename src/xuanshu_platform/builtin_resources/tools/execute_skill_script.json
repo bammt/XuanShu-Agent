@@ -1,0 +1,9 @@
+{
+  "name": "execute_skill_script",
+  "kind": "platform_executor",
+  "description": "Run a command from a bound Skill package directory and publish new deliverables to the application workspace.",
+  "working_directory": "workspace/.xuanshu/skills/<skill>",
+  "network_access": true,
+  "records_provenance": true,
+  "optional": true
+}
