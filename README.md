@@ -318,6 +318,5 @@ docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d --no-build
 - [`AGENTS.md`](AGENTS.md)：CrewAI 版本、代码模式和开发约束。
 - [CrewAI 官方文档](https://docs.crewai.com/)：Agent、Task、Crew、Flow、Skill 和 Tool 参考。
 
-## 许可证与部署提示
-
-当前仓库未声明开源许可证。部署到公网前，请确认模型供应商、上传文件、知识库内容、Trace 和日志的合规要求，并在反向代理层启用 HTTPS、限制管理端访问和配置备份策略。
+## 联系我
+VX:a1269586480
