@@ -1,0 +1,6 @@
+{
+  "name": "read_spreadsheet",
+  "kind": "platform",
+  "description": "Read XLSX workbook content from the application workspace.",
+  "working_directory": "workspace"
+}

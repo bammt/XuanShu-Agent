@@ -42,6 +42,15 @@ def interactive_agent_ids(spec: ApplicationDefinition) -> set[str]:
     return {str(item.id) for item in spec.agents if bool(item.user_interaction)}
 
 
+def bound_ask_user_agent_ids(agents: dict[str, Agent]) -> set[str]:
+    """Resolve interaction from materialized tools, not generated prompt text."""
+    return {
+        str(agent_id) for agent_id, agent in agents.items()
+        if any(str(getattr(tool, 'name', '')) == 'ask_user'
+               for tool in (getattr(agent, 'tools', None) or []))
+    }
+
+
 def interactive_input_schema(spec: ApplicationDefinition) -> dict[str, dict[str, Any]]:
     """Expose optional field hints without binding ``ask_user`` to run inputs."""
     return {
@@ -117,7 +126,11 @@ def build_runtime(row,spec,profiles,resources=None,execution_scope='legacy'):
         function_llm=None
         if function_profile:
             function_llm=profile_llm(function_profile)
-        agents[item.id]=Agent(role=item.role,goal=item.goal,backstory=item.backstory,llm=llm,
+        runtime_backstory = (
+            interactive_agent_backstory(item.backstory)
+            if str(item.id) in ask_user_agents else item.backstory
+        )
+        agents[item.id]=Agent(role=item.role,goal=item.goal,backstory=runtime_backstory,llm=llm,
             function_calling_llm=function_llm,tools=agent_tools,knowledge=agent_knowledge,
             skills=skill_packages or None,mcps=mcps or None,apps=apps or None,
             memory=shared.scope(f'/agent/{item.id}') if shared and item.memory else False,verbose=False,
@@ -160,6 +173,7 @@ PLANNER_FIELDS = (
     {'plan', 'steps', 'ready'},
     {'goal_already_achieved', 'remaining_plan_still_valid', 'suggested_refinements'},
 )
+COLLECTION_COMPLETE_MARKER = '<XUANSHU_COLLECTION_COMPLETE>'
 LOCAL_ARTIFACT_LINK = re.compile(
     r'\[[^\]\r\n]*\]\(\s*<?(?:file://)?/var/lib/xuanshu/workspaces/[^\r\n>)]*>?\s*\)'
 )
@@ -285,15 +299,91 @@ def current_turn_context(inputs: dict) -> str:
     return '\n'.join(parts)
 
 
-def interactive_agent_prompt(prompt: str, inputs: dict) -> str:
-    """Give an explicitly interactive Agent the platform pause contract."""
+def ask_user_contract_guidance(allowed_inputs: dict[str, dict[str, Any]]) -> str:
+    declared = [
+        {
+            'input_name': name,
+            'input_type': item.get('input_type', 'text'),
+            'label': item.get('label') or name,
+            'required': bool(item.get('required')),
+        }
+        for name, item in allowed_inputs.items()
+    ]
     return (
-        f'{current_turn_context(inputs)}\n\n{prompt}\n\n'
-        '你已开启与用户交互能力。请先核对本轮消息、已有会话历史、附件和上游结果。'
-        '如果完成最终输出仍缺少无法安全推断的必要信息，必须调用 ask_user 提出具体问题；'
-        '通用追问不要填 input_name。调用后立即停止当前节点，不得调用交付工具或输出占位交付物。'
-        '信息足够时才按任务的 expected_output 完成最终交付。'
+        '当前应用允许 ask_user 使用的运行输入契约如下：'
+        f'{json.dumps(declared, ensure_ascii=False)}。'
+        'ask_user.input_name 只能从上面 input_name 的值中原样选择；'
+        'text、long_text、file、image、number、boolean、json 是 input_type，绝不能填入 input_name。'
+        '只有问题明确要求用户补充某个已声明字段时才填写 input_name，并同时填写对应 input_type；'
+        '询问范围、偏好、阈值、确认意见等通用业务信息时必须省略 input_name。'
     )
+
+
+def interactive_agent_backstory(backstory: str) -> str:
+    """Put the generic interaction contract in CrewAI's Agent context."""
+    return (
+        '【平台强制交互协议｜最高优先级】\n'
+        '你已绑定 ask_user 工具，负责在执行工作前收集并确认用户信息。'
+        '只要当前节点还需要从用户处收集任何其他信息，就必须调用 ask_user；'
+        '绝对禁止把问题、待确认项或“请补充……”作为普通文本、Final Answer 或节点业务结果输出。'
+        '调用 ask_user 后必须立即停止当前节点，等待平台恢复。'
+        f'只有信息已经完整且无歧义时，才允许生成业务结果，并在结果第一行输出精确标记 '
+        f'{COLLECTION_COMPLETE_MARKER}；该标记由平台移除。\n'
+        '【原始 Agent 背景】\n'
+        f'{backstory}'
+    )
+
+
+def interactive_agent_prompt(prompt: str, inputs: dict,
+                             allowed_inputs: dict[str, dict[str, Any]]) -> str:
+    """Inject the platform pause contract for an Agent bound to ``ask_user``."""
+    return (
+        '【平台强制交互协议｜当前节点是信息收集节点｜优先于下方所有业务要求】\n'
+        '本节点必须先核对本轮消息、会话历史、附件和上游结果是否足以完成业务。'
+        '只要当前节点还需要从用户处收集任何其他信息，就必须调用 ask_user 工具；'
+        '向用户提问不能直接输出文本，不能作为 Final Answer、expected_output 或节点结果返回。'
+        '即使下方要求“只返回最终结果”或描述了结构化交付物，信息未收集完整时也不得提前交付、'
+        '不得采用默认值补齐、不得继续执行下游工作。调用 ask_user 后立即停止当前节点并等待用户回复。'
+        '只有所需信息完整且无歧义时，才可跳过 ask_user 并完成业务输出；此时必须在业务结果第一行'
+        f'输出精确标记 {COLLECTION_COMPLETE_MARKER}。平台只有检测到该标记才允许进入下一节点，'
+        '并会在展示及传递结果前移除标记。\n'
+        f'{ask_user_contract_guidance(allowed_inputs)}'
+        '\n\n【当前轮次信息】\n'
+        f'{current_turn_context(inputs)}\n\n'
+        '【当前节点业务任务】\n'
+        f'{prompt}\n\n'
+        '【进入下一节点前强制检查】只要还需要从用户处收集任何其他信息，就必须调用 ask_user；'
+        f'只有信息收集已经完成并输出 {COLLECTION_COMPLETE_MARKER}，平台才允许进入下一节点。'
+    )
+
+
+def completed_collection_output(raw: str) -> str:
+    """Require an explicit completion signal before leaving an interactive node."""
+    text = str(raw or '').strip()
+    if not text.startswith(COLLECTION_COMPLETE_MARKER):
+        raise RuntimeError(
+            '信息收集节点未调用 ask_user，也未声明信息收集完成；为避免在信息不完整时执行下游，'
+            '本次运行已停止。'
+        )
+    result = text[len(COLLECTION_COMPLETE_MARKER):].lstrip(' \t\r\n:：-')
+    if not result:
+        raise RuntimeError('信息收集节点声明完成但没有返回可传递的业务结果，本次运行已停止。')
+    return result
+
+
+def ask_user_failure_event(request_store: AskUserRequestStore | None, node_id: str,
+                           node_name: str) -> dict[str, Any] | None:
+    failure = request_store.consume_failure() if request_store else None
+    if not failure:
+        return None
+    return {
+        'type': 'tool.failed',
+        'node_id': str(node_id),
+        'node_name': str(node_name),
+        'tool_name': failure.get('tool_name') or 'ask_user',
+        'arguments': failure.get('arguments') or {},
+        'error': failure.get('error') or '工具调用失败',
+    }
 
 
 def normalize_legacy_interaction_switch(definition: dict) -> dict:
@@ -443,7 +533,7 @@ def execute_crew(row,spec,agents,shared,inputs,outputs,profiles,runtime_state,
     }
     ordered=ordered_tasks(spec,outputs)
     task_by_id = {task.id: task for task in ordered}
-    ask_user_agents = interactive_agent_ids(spec)
+    ask_user_agents = bound_ask_user_agent_ids(agents)
     events=[]
     execution_id = str(runtime_state.get('execution_id') or runtime_state.get('run_id') or 'run')
     for item in ordered:
@@ -475,7 +565,9 @@ def execute_crew(row,spec,agents,shared,inputs,outputs,profiles,runtime_state,
             else str(item.agent_id or '')
         )
         if interactive_owner in ask_user_agents:
-            description = interactive_agent_prompt(description, inputs)
+            description = interactive_agent_prompt(
+                description, inputs, interactive_input_schema(spec),
+            )
         checkpoint_inputs = dict(mapped_inputs)
         if feedback and feedback_node == item.id:
             checkpoint_inputs['_human_feedback'] = feedback
@@ -497,9 +589,11 @@ def execute_crew(row,spec,agents,shared,inputs,outputs,profiles,runtime_state,
         request_store = agent_ask_user_store(ask_user_store, interactive_owner)
         waiting_input = request_store.consume() if request_store else None
         if not waiting_input and request_store:
-            error = request_store.consume_error()
-            if error:
-                raise RuntimeError(error)
+            failure = ask_user_failure_event(request_store, item.id, item.name)
+            if failure:
+                events.append(failure)
+                emit_runtime_event(event_callback, failure)
+                raise RuntimeError(str(failure['error']))
         if waiting_input:
             checkpoint.pause_for_input(item.id, waiting_input)
             paused={'type':'run.waiting_input','node_id':item.id,'node_name':item.name,
@@ -512,6 +606,8 @@ def execute_crew(row,spec,agents,shared,inputs,outputs,profiles,runtime_state,
         task_outputs=list(getattr(result,'tasks_output',[]) or [])
         task_output = task_outputs[-1] if task_outputs else result
         raw=user_visible_output(getattr(task_output,'raw',task_output))
+        if interactive_owner in ask_user_agents:
+            raw = completed_collection_output(raw)
         delivered = node_artifacts_from_receipts(
             receipt_store.items if receipt_store is not None else [], receipt_offset,
         )
@@ -597,12 +693,12 @@ def execute_flow_crew(row,item,agents,node_prompt,inputs,outputs,
     for agent_id in item.crew_agent_ids:
         request_store = agent_ask_user_store(ask_user_store, agent_id)
         if request_store:
-            error = request_store.consume_error()
-            if error:
-                raise RuntimeError(error)
+            failure = ask_user_failure_event(request_store, item.id, item.name)
+            if failure:
+                return '', None, failure
             if request_store.request:
-                return '', request_store.consume()
-    return user_visible_output(result.raw), None
+                return '', request_store.consume(), None
+    return user_visible_output(result.raw), None, None
 
 def execute_flow(
     row,
@@ -630,7 +726,7 @@ def execute_flow(
     task_by_id = {task.id: task for task in ordered}
     if len(ordered)>spec.max_method_calls: raise ValueError(f'Flow 节点数超过最大方法调用次数 {spec.max_method_calls}')
     collection_task_id = None
-    ask_user_agents = interactive_agent_ids(spec)
+    ask_user_agents = bound_ask_user_agent_ids(agents)
     if spec.interaction_mode == 'multi_turn' and ordered:
         configured_collection = str((spec.interaction or {}).get('collection_task_id') or '').strip()
         candidate = configured_collection if configured_collection in {x.id for x in ordered} else ordered[0].id
@@ -639,17 +735,7 @@ def execute_flow(
             collection_task_id = candidate
 
     def collection_prompt(prompt: str) -> str:
-        declared = '、'.join(
-            f'{item.name}({item.input_type})' for item in spec.inputs
-        ) or '无'
-        return (f'{interactive_agent_prompt(prompt, inputs)}\n\n'
-                '这是一个多轮会话节点。请先检查会话历史、本轮用户消息和当前已有附件。'
-                '如果缺少继续工作所必需的信息，必须调用平台工具 ask_user 提出具体问题；'
-                f'已声明运行输入：{declared}。通用追问省略 input_name；'
-                '只有问题明确针对某个已声明字段时才填写它，并使用该字段真实类型。'
-                '文件和图片由用户在同一聊天回复中上传，可以将 file/image 字段作为可选的 input_name 提示界面。'
-                '调用后停止当前节点，平台会等待用户回复并从当前节点恢复。'
-                '只有信息足够时才返回该节点的业务结果，不要输出状态标记或控制 JSON。')
+        return interactive_agent_prompt(prompt, inputs, interactive_input_schema(spec))
 
     class ApplicationFlow(Flow[RuntimeState]):
         @start()
@@ -685,7 +771,14 @@ def execute_flow(
                     str(item.agent_id or '') in ask_user_agents
                     or any(str(agent_id) in ask_user_agents for agent_id in item.crew_agent_ids)
                 ):
-                    prompt = interactive_agent_prompt(prompt, inputs)
+                    prompt = interactive_agent_prompt(
+                        prompt, inputs, interactive_input_schema(spec),
+                    )
+                interactive_node = (
+                    item.id == collection_task_id
+                    or str(item.agent_id or '') in ask_user_agents
+                    or any(str(agent_id) in ask_user_agents for agent_id in item.crew_agent_ids)
+                )
                 checkpoint_inputs = dict(mapped_inputs)
                 if feedback and feedback_node == item.id:
                     checkpoint_inputs['_human_feedback'] = feedback
@@ -719,9 +812,13 @@ def execute_flow(
                     agent_role='隔离代码执行器'
                 elif item.node_type=='crew':
                     with execution_idempotency_scope(idempotency_key):
-                        raw, waiting_input = execute_flow_crew(
+                        raw, waiting_input, tool_failure = execute_flow_crew(
                             row,item,agents,prompt,mapped_inputs,self.state.outputs,ask_user_store,
                         )
+                    if tool_failure:
+                        self.state.events.append(tool_failure)
+                        emit_runtime_event(event_callback, tool_failure)
+                        raise RuntimeError(str(tool_failure['error']))
                     agent_role='Crew ('+', '.join(agents[x].role for x in item.crew_agent_ids)+')'
                     if waiting_input:
                         checkpoint.pause_for_input(item.id, waiting_input)
@@ -738,9 +835,11 @@ def execute_flow(
                     request_store = agent_ask_user_store(ask_user_store, item.agent_id)
                     waiting_input = request_store.consume() if request_store else None
                     if not waiting_input and request_store:
-                        error = request_store.consume_error()
-                        if error:
-                            raise RuntimeError(error)
+                        failure = ask_user_failure_event(request_store, item.id, item.name)
+                        if failure:
+                            self.state.events.append(failure)
+                            emit_runtime_event(event_callback, failure)
+                            raise RuntimeError(str(failure['error']))
                     if waiting_input:
                         checkpoint.pause_for_input(item.id, waiting_input)
                         self.state.status='waiting_input'; self.state.output=waiting_input['question']; self.state.pending_node=item.id
@@ -750,6 +849,8 @@ def execute_flow(
                         paused['checkpoint'] = checkpoint.dump()
                         self.state.events.append(paused); emit_runtime_event(event_callback,paused); return self.state.output
                     agent_role=agents[item.agent_id].role
+                if interactive_node:
+                    raw = completed_collection_output(raw)
                 delivered = node_artifacts_from_receipts(
                     receipt_store.items if receipt_store is not None else [], receipt_offset,
                 )

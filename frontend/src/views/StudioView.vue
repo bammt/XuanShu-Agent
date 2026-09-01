@@ -1931,12 +1931,22 @@ function formatBytes(value) {
     ? `${Math.max(1, Math.round(value / 1024))} KB`
     : `${(value / 1024 / 1024).toFixed(1)} MB`;
 }
-function capabilityLabel(id) {
+function capabilityLabel(id, resourceType = "") {
+  const collections = {
+    skill: store.skills,
+    tool: store.plugins,
+    knowledge: store.knowledge,
+  };
+  const selected = collections[resourceType];
+  if (selected) {
+    return (
+      selected.find((item) => String(item.id) === String(id))?.name || id
+    );
+  }
   return (
-    store.skills.find((item) => String(item.id) === String(id))?.name ||
-    store.plugins.find((item) => String(item.id) === String(id))?.name ||
-    store.knowledge.find((item) => String(item.id) === String(id))?.name ||
-    id
+    [...store.skills, ...store.plugins, ...store.knowledge].find(
+      (item) => String(item.name) === String(id),
+    )?.name || id
   );
 }
 async function save() {
@@ -3246,7 +3256,7 @@ function chooseStructure(kind) {
                 <div><strong>{{ requirement.label }}</strong><span v-if="requirement.required !== false && !(requirement.selected_ids || []).length" class="status-badge failed">必需，尚未满足</span><p>{{ requirement.reason }}</p></div>
                 <div v-if="requirement.selected_ids?.length" class="proposal-capability-actions">
                   <button v-for="id in requirement.selected_ids" :key="id" class="button small" @click="removeProposalCapability(message.proposal, requirement, id)">
-                    {{ capabilityLabel(id) }} <X :size="12" />
+                    {{ capabilityLabel(id, requirement.resource_type) }} <X :size="12" />
                   </button>
                 </div>
                 <div class="proposal-capability-actions">
@@ -3422,7 +3432,7 @@ function chooseStructure(kind) {
                       }}</small
                       ><small v-if="agent.tools.length"
                         >工具：{{
-                          agent.tools.map(capabilityLabel).join("、")
+                          agent.tools.map((id) => capabilityLabel(id, "tool")).join("、")
                         }}</small
                       >
                     </div>

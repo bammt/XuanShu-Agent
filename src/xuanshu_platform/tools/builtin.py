@@ -12,6 +12,8 @@ from crewai.mcp import MCPServerHTTP, MCPServerSSE
 from crewai.mcp.tool_resolver import MCPToolResolver
 from pydantic import BaseModel, Field
 from docx import Document
+from openpyxl import load_workbook
+from openpyxl.utils import get_column_letter
 from pypdf import PdfReader
 from ..config import settings
 
@@ -80,6 +82,11 @@ from ..services import (app_root_dir, app_session_dir, delete_session_file, reso
                         sync_existing_session_file)
 
 class FileInput(BaseModel): filename:str=Field(description='应用工作目录中的文件名')
+class SpreadsheetInput(FileInput):
+    sheet_name: str | None = Field(default=None, description='可选工作表名称；不填写时读取所有工作表')
+    start_row: int = Field(default=1, ge=1, le=1_048_576, description='开始读取的行号，从 1 开始')
+    max_rows: int = Field(default=100, ge=1, le=500, description='每个工作表本次最多读取的行数')
+    max_columns: int = Field(default=30, ge=1, le=200, description='每个工作表本次最多读取的列数')
 class CodeInput(BaseModel): code:str=Field(description='需要执行的 Python 代码')
 class CommandInput(BaseModel): command:str=Field(description='需要在应用隔离工作目录执行的 shell 命令')
 class SkillCommandInput(BaseModel):
@@ -106,6 +113,7 @@ class AskUserRequestStore:
     def __init__(self) -> None:
         self.request: dict[str, Any] | None = None
         self.error: str | None = None
+        self.failure: dict[str, Any] | None = None
 
     def set(self, request: dict[str, Any]) -> None:
         if self.request is None:
@@ -116,24 +124,36 @@ class AskUserRequestStore:
         self.request = None
         return request
 
-    def set_error(self, message: str) -> None:
+    def set_error(self, message: str, *, tool_name: str = 'ask_user',
+                  arguments: dict[str, Any] | None = None) -> None:
         if self.error is None:
             self.error = str(message)
+            self.failure = {
+                'tool_name': str(tool_name or 'ask_user'),
+                'arguments': dict(arguments or {}),
+                'error': str(message),
+            }
+
+    def consume_failure(self) -> dict[str, Any] | None:
+        failure = self.failure
+        self.failure = None
+        self.error = None
+        return failure
 
     def consume_error(self) -> str | None:
-        error = self.error
-        self.error = None
-        return error
+        failure = self.consume_failure()
+        return str(failure.get('error') or '') if failure else None
 
 
 class AskUserInput(BaseModel):
     question: str = Field(description='需要向最终用户提出的具体问题')
     input_name: str = Field(
         default='',
-        description='可选；问题明确针对某个已声明运行输入时填写字段名，通用追问留空',
+        description=('可选；只能填写当前应用已声明运行输入的机器字段名，不能填写 text、file、image 等类型；'
+                     '通用业务追问必须留空'),
     )
     input_type: Literal['text', 'long_text', 'file', 'image', 'number', 'boolean', 'json'] | None = Field(
-        default=None, description='可省略；指定 input_name 时必须与已声明输入类型一致'
+        default=None, description='可省略；这里才填写 text、file、image 等字段类型，且必须与 input_name 的声明一致'
     )
     required: bool = Field(default=True, description='该信息是否必须提供')
 
@@ -160,10 +180,16 @@ class AskUserTool(BaseTool):
 
     def _run(self, question: str, input_name: str = '', input_type: str | None = None,
              required: bool = True) -> str:
+        arguments = {
+            'question': str(question or ''),
+            'input_name': str(input_name or ''),
+            'input_type': input_type,
+            'required': bool(required),
+        }
         question = str(question or '').strip()
         if not question:
             message = '无法向用户提问：question 不能为空。'
-            self.request_store.set_error(message)
+            self.request_store.set_error(message, tool_name=self.name, arguments=arguments)
             return message
         input_name = str(input_name or '').strip()
         contract = self.allowed_inputs.get(input_name) if input_name else None
@@ -174,7 +200,7 @@ class AskUserTool(BaseTool):
             allowed = '、'.join(self.allowed_inputs) or '无'
             message = (f'无法向用户提问：input_name={input_name} 不在当前应用的运行输入契约中。'
                        f'当前可用字段：{allowed}。')
-            self.request_store.set_error(message)
+            self.request_store.set_error(message, tool_name=self.name, arguments=arguments)
             return message
         requested_type = str(input_type or '').strip()
         normalized_type = str((contract or {}).get('input_type') or requested_type or 'text').strip()
@@ -187,7 +213,7 @@ class AskUserTool(BaseTool):
             else:
                 message = (f'无法向用户提问：字段 {input_name} 的类型必须是 '
                            f"{contract.get('input_type')}，不能是 {requested_type}。")
-                self.request_store.set_error(message)
+                self.request_store.set_error(message, tool_name=self.name, arguments=arguments)
                 return message
         file_inputs = [
             name for name, item in self.allowed_inputs.items()
@@ -213,6 +239,108 @@ class DocumentReaderTool(BaseTool):
         if path.suffix.lower()=='.docx': return '\n'.join(p.text for p in Document(path).paragraphs)
         if path.suffix.lower()=='.pdf': return '\n'.join((p.extract_text() or '') for p in PdfReader(path).pages)
         return '仅支持 DOCX 和 PDF'
+class SpreadsheetReaderTool(BaseTool):
+    name: str = 'read_spreadsheet'
+    description: str = (
+        '读取应用工作目录中的 XLSX 工作簿。可读取全部或指定工作表，保留单元格值和公式；'
+        '大型工作表可通过 start_row 分段读取。'
+    )
+    args_schema: type[BaseModel] = SpreadsheetInput
+    workspace_id: int
+    app_id: int
+    execution_scope: str
+    app_kind: str = 'crew'
+
+    @staticmethod
+    def _cell_text(value: Any) -> str:
+        if value is None:
+            return ''
+        if hasattr(value, 'isoformat'):
+            try:
+                value = value.isoformat()
+            except (TypeError, ValueError):
+                pass
+        return str(value).replace('|', '\\|').replace('\r\n', '<br>').replace('\n', '<br>').replace('\r', '<br>')
+
+    def _run(self, filename: str, sheet_name: str | None = None, start_row: int = 1,
+             max_rows: int = 100, max_columns: int = 30) -> str:
+        root = app_session_dir(self.workspace_id, self.app_id, self.execution_scope, self.app_kind).resolve()
+        try:
+            path = resolve_app_file(root, filename)
+        except ValueError:
+            return '文件不存在'
+        if not path.is_file():
+            return '文件不存在'
+        if path.suffix.lower() != '.xlsx':
+            return '仅支持 XLSX 文件'
+        try:
+            workbook = load_workbook(path, read_only=True, data_only=False)
+        except Exception as exc:
+            return f'无法读取 XLSX 文件：{exc}'
+        try:
+            if sheet_name and sheet_name not in workbook.sheetnames:
+                return f'工作表不存在。当前工作表：{"、".join(workbook.sheetnames)}'
+            worksheets = [workbook[sheet_name]] if sheet_name else list(workbook.worksheets)
+            lines = [f'工作簿：{path.name}', f'工作表：{"、".join(workbook.sheetnames)}']
+            output_limit = 20_000
+            output_size = sum(len(item) + 1 for item in lines)
+            output_truncated = False
+
+            def append(line: str) -> bool:
+                nonlocal output_size, output_truncated
+                line_size = len(line) + 1
+                if output_size + line_size > output_limit:
+                    output_truncated = True
+                    return False
+                lines.append(line)
+                output_size += line_size
+                return True
+
+            for worksheet in worksheets:
+                column_count = min(max(worksheet.max_column, 1), max_columns)
+                last_row = min(worksheet.max_row, start_row + max_rows - 1)
+                if not append(f'\n## 工作表：{worksheet.title}'):
+                    break
+                append(
+                    f'范围：{worksheet.calculate_dimension()}；本次读取第 {start_row}-{last_row} 行，'
+                    f'最多 {column_count} 列'
+                )
+                headers = ['行号', *(get_column_letter(index) for index in range(1, column_count + 1))]
+                if not append('| ' + ' | '.join(headers) + ' |'):
+                    break
+                if not append('| ' + ' | '.join('---' for _ in headers) + ' |'):
+                    break
+                has_data = False
+                if start_row <= last_row:
+                    for row_number, row in enumerate(
+                        worksheet.iter_rows(
+                            min_row=start_row, max_row=last_row, min_col=1, max_col=column_count,
+                            values_only=True,
+                        ),
+                        start=start_row,
+                    ):
+                        values = [self._cell_text(value) for value in row]
+                        if not any(values):
+                            continue
+                        has_data = True
+                        if not append('| ' + ' | '.join([str(row_number), *values]) + ' |'):
+                            break
+                if output_truncated:
+                    break
+                if not has_data:
+                    append('（指定范围内无数据）')
+                if worksheet.max_row > last_row:
+                    append(
+                        f'（工作表还有更多行；使用 sheet_name="{worksheet.title}"、'
+                        f'start_row={last_row + 1} 继续读取。）'
+                    )
+                if worksheet.max_column > column_count:
+                    append(f'（工作表共有 {worksheet.max_column} 列，本次只读取前 {column_count} 列。）')
+            if output_truncated:
+                lines.append('（输出达到长度限制；请指定 sheet_name 和 start_row 分段读取。）')
+            return '\n'.join(lines)
+        finally:
+            workbook.close()
 class SandboxedPythonTool(BaseTool):
     name:str='execute_python'; description:str=(
         '在当前应用隔离工作目录执行 Python。已绑定 Skill 通过 '
@@ -478,9 +606,13 @@ def builtin_tools(workspace_id: int, app_id: int, *, app_kind: str = 'crew', inc
                   receipt_store: ExecutionReceiptStore | None = None,
                   ask_user_store: AskUserRequestStore | None = None,
                   ask_user_inputs: dict[str, dict[str, Any]] | None = None) -> list[BaseTool]:
-    tools: list[BaseTool] = [DocumentReaderTool(
-        workspace_id=workspace_id, app_id=app_id, execution_scope=execution_scope, app_kind=app_kind,
-    )]
+    reader_options = {
+        'workspace_id': workspace_id,
+        'app_id': app_id,
+        'execution_scope': execution_scope,
+        'app_kind': app_kind,
+    }
+    tools: list[BaseTool] = [DocumentReaderTool(**reader_options), SpreadsheetReaderTool(**reader_options)]
     if ask_user_store is not None:
         tools.append(AskUserTool(request_store=ask_user_store,
                                  allowed_inputs=ask_user_inputs or {}))

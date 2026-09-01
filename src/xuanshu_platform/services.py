@@ -404,7 +404,10 @@ def materialize_application_resources(
     temporary.replace(manifest_path)
     tool_manifest = {
         'version': 2,
-        'tools': ['read_document', *(['execute_python', 'execute_command', 'execute_skill_script'] if include_code else [])],
+        'tools': [
+            'read_document', 'read_spreadsheet',
+            *(['execute_python', 'execute_command', 'execute_skill_script'] if include_code else []),
+        ],
         'implementation': 'xuanshu_platform.tools.builtin',
     }
     if refresh:

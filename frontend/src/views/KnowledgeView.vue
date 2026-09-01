@@ -2,6 +2,7 @@
 import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { useRoute, useRouter } from "vue-router";
 import {
+  ArrowLeft,
   BookOpen,
   FileText,
   Search,
@@ -191,7 +192,7 @@ function size(value) {
 <template>
   <template v-if="route.params.id">
     <div class="page-heading">
-      <div><button class="text-button" @click="router.push('/knowledge')">返回知识库</button><h2>{{ detail?.name || '知识库详情' }}</h2><p>{{ detail?.description || '管理文件、解析状态和向量索引。' }}</p></div>
+      <div><button class="text-button knowledge-back-button" @click="router.push('/knowledge')"><ArrowLeft :size="15" />返回知识库</button><h2>{{ detail?.name || '知识库详情' }}</h2><p>{{ detail?.description || '管理文件、解析状态和向量索引。' }}</p></div>
       <div class="heading-actions"><button v-if="route.query.returnTo" class="button" @click="router.push(String(route.query.returnTo))">返回编排</button><label class="button primary"><Upload :size="15" />上传文件<input type="file" hidden multiple accept=".pdf,.docx,.txt,.md,.csv,.json,.xml,.yaml,.yml" @change="uploadDetailFiles" /></label></div>
     </div>
     <section v-if="detail" class="knowledge-detail-grid">

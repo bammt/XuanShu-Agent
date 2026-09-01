@@ -20,6 +20,7 @@ dependencies = [
     ,"httpx>=0.28.1"
     ,"python-docx>=1.1.2"
     ,"pypdf>=5.1.0"
+    ,"openpyxl>=3.1.5"
     ,"qdrant-client>=1.15.0,<1.16.0"
     ,"openai>=1.75.0"
     ,"cryptography>=44.0.0"
@@ -36,3 +37,6 @@ packages = ["src/xuanshu_platform"]
 [tool.crewai]
 type = "flow"
 project_id = "caf3e20b-1fad-460a-a9c5-ca26e67650cc"
+
+[dependency-groups]
+dev = ["pytest>=8.3.4"]

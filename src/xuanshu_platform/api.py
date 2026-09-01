@@ -1719,11 +1719,12 @@ async def studio_resources(workspace_id: int) -> dict:
         knowledge_bases = (await db.scalars(select(KnowledgeBase).where(
             KnowledgeBase.workspace_id == workspace_id, KnowledgeBase.status == 'ready'))).all()
     return {
-        'skills': [{'id': str(item.id), 'name': item.name, 'description': item.description} for item in skills],
-        'tools': [{'id': str(item.id), 'name': item.name, 'kind': item.kind,
+        'skills': [{'id': str(item.id), 'resource_type': 'skill', 'name': item.name,
+                    'description': item.description} for item in skills],
+        'tools': [{'id': str(item.id), 'resource_type': 'tool', 'name': item.name, 'kind': item.kind,
                    'description': (item.configuration or {}).get('description', '')} for item in plugins],
-        'knowledge': [{'id': str(item.id), 'name': item.name, 'description': item.description,
-                       'status': item.status} for item in knowledge_bases],
+        'knowledge': [{'id': str(item.id), 'resource_type': 'knowledge', 'name': item.name,
+                       'description': item.description, 'status': item.status} for item in knowledge_bases],
     }
 
 
@@ -1782,16 +1783,17 @@ async def studio_composer_resources(resources: dict, workspace_id: int,
                 }.items() if value not in {None, ''}
             })
         skill_details.append({
-            'id': str(row.id), 'name': row.name, 'description': row.description,
+            'id': str(row.id), 'resource_type': 'skill', 'name': row.name,
+            'description': row.description,
             'instructions': str(document.get('instructions') or ''),
             'files': files,
         })
     details = {
         'skills': skill_details,
-        'tools': [plugin_document(row) for row in plugins],
+        'tools': [{**plugin_document(row), 'resource_type': 'tool'} for row in plugins],
         'knowledge': [
-            {'id': str(row.id), 'name': row.name, 'description': row.description,
-             'status': row.status}
+            {'id': str(row.id), 'resource_type': 'knowledge', 'name': row.name,
+             'description': row.description, 'status': row.status}
             for row in knowledge
         ],
     }
@@ -3571,8 +3573,12 @@ def run_document(run: Run, app_row: Application | None = None) -> dict:
             'files': artifact_documents(run, app_row, f'/api/runs/{run.id}/files'),
             'pending_feedback': pending, 'waiting_input': waiting_input, 'events': [
                 {'at': event_time(item), 'type': item.get('type', 'event'),
-                 'title': item.get('node_name') or item.get('application') or item.get('type', '事件'),
-                 'detail': item.get('error') or item.get('message') or item.get('output', '')[:300]}
+                 'title': (f"{item.get('tool_name', '工具')} 调用失败"
+                           if item.get('type') == 'tool.failed'
+                           else item.get('node_name') or item.get('application') or item.get('type', '事件')),
+                 'detail': item.get('error') or item.get('message') or item.get('output', '')[:300],
+                 **({'tool_name': item.get('tool_name'), 'arguments': item.get('arguments', {})}
+                    if item.get('type') == 'tool.failed' else {})}
                 for item in events], 'created_at': run.created_at.isoformat()}
 
 

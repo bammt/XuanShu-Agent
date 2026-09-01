@@ -1,178 +1,182 @@
-# 玄枢 XuanShu
+# XuanShu
 
-玄枢是一个面向团队的多租户 CrewAI 智能应用平台，把自然语言编排、画布编辑、模型连接、Skills、Tools、知识库、发布运行和运行观测放在同一个工作空间中。
+[中文版](README.zh-CN.md) | English
 
-生成的应用既可以是 Crew，也可以是 Flow。Crew 适合一次性、顺序或层级的多智能体协作；Flow 适合带状态、路由、人工反馈和多轮对话的业务流程。两者都由 CrewAI 原生运行时执行，而不是转换成临时脚本。
+[![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 
-## 功能概览
+XuanShu is a multi-tenant CrewAI application platform for teams. It brings natural-language orchestration, visual canvas editing, model connections, Skills, Tools, knowledge bases, publishing, execution, and observability into one workspace.
 
-- **自然语言编排**：按信息收集、输入确认、架构确认和生成校验逐步形成可运行定义。
-- **画布编辑**：直接添加和连接 Agent、Task、Crew、Router、Code、人工审批等节点。
-- **Crew 与 Flow**：支持顺序/层级 Crew，以及显式状态、分支、审批和 `ask_user` 的 Flow。
-- **模型连接**：按工作空间管理供应商、模型、Base URL、API Key、超时、重试和思考参数。
-- **Skills、Tools、知识库**：为 Agent 绑定标准 Skill、HTTP/远程 MCP/隔离 Python/Connected App 工具和向量知识库。
-- **多轮运行**：只有显式启用 `ask_user` 的 Agent 才会暂停等待用户；恢复时复用同一会话和运行检查点。
-- **发布与调用**：支持内部应用、匿名公开聊天页和带 API Key 的程序接口。
-- **运行观测**：查看节点状态、最终输出、审批、交付文件、事件流和 Trace。
-- **安全执行**：代码在独立 executor 容器中运行，仅能访问当前应用工作目录；资源和凭据按工作空间隔离。
+Applications can be built as either Crews or Flows. Crews are suited to one-shot, sequential, or hierarchical multi-agent collaboration. Flows are designed for stateful business processes involving routing, human feedback, and multi-turn conversations. Both are executed by the native CrewAI runtime rather than being converted into temporary scripts.
 
-## 界面预览
+## Features
 
-### 工作空间控制台
+- **Natural-language orchestration**: progressively produces an executable definition through discovery, input confirmation, architecture confirmation, generation, and validation.
+- **Visual canvas editor**: directly add and connect Agent, Task, Crew, Router, Code, and human-approval nodes.
+- **Crew and Flow support**: build sequential or hierarchical Crews, as well as Flows with explicit state, branching, approvals, and `ask_user` interactions.
+- **Model connections**: manage providers, model names, Base URLs, API keys, timeouts, retries, and reasoning parameters per workspace.
+- **Skills, Tools, and knowledge bases**: bind standard Skills, HTTP tools, remote MCP servers, isolated Python tools, Connected Apps, and vector knowledge bases to Agents.
+- **Multi-turn execution**: only Agents with `ask_user` explicitly enabled can pause for user input; execution resumes in the same conversation from a persisted checkpoint.
+- **Publishing and API access**: provide internal applications, anonymous public chat pages, and API-key-protected programmatic endpoints.
+- **Execution observability**: inspect node status, final output, approvals, generated files, event streams, and Traces.
+- **Isolated execution**: code runs in a separate executor container that can only access the current application's workspace; resources and credentials are isolated by workspace.
 
-![玄枢控制台](docs/screenshots/desktop-dashboard.png)
+## Screenshots
 
-### 自然语言编排台
+### Workspace Dashboard
 
-![玄枢编排台](docs/screenshots/desktop-studio.png)
+![XuanShu workspace dashboard](docs/screenshots/desktop-dashboard.png)
 
-### 应用运行与节点进度
+### Natural-Language Studio
 
-![应用运行界面](docs/screenshots/desktop-app-run.png)
+![XuanShu Studio](docs/screenshots/desktop-studio.png)
 
-### Agent、知识库和资源
+### Application Run and Node Progress
 
-![Agent 管理](docs/screenshots/desktop-agents.png)
+![Application run view](docs/screenshots/desktop-app-run.png)
 
-![知识库管理](docs/screenshots/desktop-knowledge.png)
+### Agents, Knowledge, and Resources
 
-![Skills 与 Tools](docs/screenshots/desktop-resources.png)
+![Agent management](docs/screenshots/desktop-agents.png)
 
-移动端也提供响应式界面：
+![Knowledge-base management](docs/screenshots/desktop-knowledge.png)
 
-![移动端控制台](docs/screenshots/mobile-dashboard.png)
+![Skills and Tools](docs/screenshots/desktop-resources.png)
 
-## 系统架构
+A responsive mobile interface is also included:
+
+![Mobile dashboard](docs/screenshots/mobile-dashboard.png)
+
+## Architecture
 
 ```mermaid
 flowchart LR
-    Browser[Vue 3 前端] -->|HTTP / SSE| API[FastAPI 后端]
+    Browser[Vue 3 frontend] -->|HTTP / SSE| API[FastAPI backend]
     API --> PG[(PostgreSQL)]
-    API --> Redis[(Redis 队列与运行态)]
-    API --> MinIO[(MinIO 文件对象)]
-    API --> Qdrant[(Qdrant 向量库)]
-    Redis --> Studio[Studio Worker<br/>编排会话]
-    Redis --> Worker[Workflow Worker<br/>应用运行]
+    API --> Redis[(Redis queues and runtime state)]
+    API --> MinIO[(MinIO objects)]
+    API --> Qdrant[(Qdrant vectors)]
+    Redis --> Studio[Studio Worker<br/>orchestration sessions]
+    Redis --> Worker[Workflow Worker<br/>application runs]
     Worker --> CrewAI[CrewAI Agent / Crew / Flow]
-    CrewAI --> Model[模型连接]
-    CrewAI --> Executor[隔离 Executor]
-    Executor --> Workspace[(应用工作目录)]
+    CrewAI --> Model[Model connection]
+    CrewAI --> Executor[Isolated Executor]
+    Executor --> Workspace[(Application workspace)]
 ```
 
-| 服务 | 作用 | 默认容器端口 |
+| Service | Responsibility | Default container port |
 | --- | --- | ---: |
-| `frontend` | Vue/Vite 开发前端或 Nginx 静态站点 | 80 |
-| `backend` | FastAPI API、认证、Studio、应用和资源管理 | 8012 |
-| `studio-worker` | 消费编排任务并保存阶段进度 | 无外部端口 |
-| `worker` | 执行已发布 Crew/Flow 并保存检查点 | 无外部端口 |
-| `executor` | 隔离执行 Python、Shell 和 Skill 脚本 | 8020（内部） |
-| `postgres` | 用户、工作空间、应用、运行和事件持久化 | 5432（内部） |
-| `redis` | 队列、锁、运行态和编排 Flow 持久化 | 6379（内部） |
-| `minio` | 上传文件、生成文件和 Skill 资源存储 | 9000/9001（内部） |
-| `qdrant` | 知识库向量索引 | 6333（内部） |
+| `frontend` | Vue/Vite development frontend or Nginx static site | 80 |
+| `backend` | FastAPI, authentication, Studio, applications, and resource management | 8012 |
+| `studio-worker` | Consumes orchestration jobs and persists stage progress | No exposed port |
+| `worker` | Executes published Crews/Flows and persists checkpoints | No exposed port |
+| `executor` | Isolated Python, Shell, and Skill script execution | 8020 (internal) |
+| `postgres` | Users, workspaces, applications, runs, and events | 5432 (internal) |
+| `redis` | Queues, locks, runtime state, and Composer Flow persistence | 6379 (internal) |
+| `minio` | Uploaded files, generated artifacts, and Skill resources | 9000/9001 (internal) |
+| `qdrant` | Knowledge-base vector index | 6333 (internal) |
 
-PostgreSQL 负责运行领取和检查点持久化，Redis 负责队列与运行态，Worker 通过心跳识别失联。Worker 重启后会跳过已完成节点；`waiting_input` 和 `waiting_approval` 不会重复执行已完成节点。
+PostgreSQL persists run ownership and checkpoints, while Redis handles queues and live runtime state. Workers use heartbeats to detect lost ownership. After a worker restart, completed nodes are skipped; nodes in `waiting_input` or `waiting_approval` are not executed again.
 
-## 编排与运行流程
+## Orchestration and Execution
 
-1. 普通问候或闲聊只由平台回复，不会创建智能应用。
-2. 当需求明确表达创建/修改应用且用途足够清楚后，进入信息收集阶段。
-3. 系统只询问尚未确定的关键内容，例如单轮/多轮交互、Skill/Tool/知识库和 Crew/Flow 类型；用户已经说清楚的内容会跳过。
-4. 输入确认阶段生成发布后的输入契约。平台应用通常包含必填的 `message` 长文本变量，用于承载用户需求描述；文件、数字、布尔和 JSON 按需增加。
-5. 架构确认阶段确定 Agent 角色、Task、节点依赖和变量来源。下游节点只能引用已确认的上游输出或发布输入。
-6. generation 阶段落实为可运行定义，执行变量契约和资源校验，必要时根据审查结果修正清单。
-7. 用户确认后保存草稿；点击发布生成不可变发布快照。运行中的应用读取发布快照，不受后续草稿编辑影响。
-8. 运行请求进入 Redis 队列，由 Worker 执行并持久化节点状态、审批、文件和事件游标。
+1. Greetings and casual conversation receive a normal platform response and do not create an application.
+2. Discovery begins only after the user clearly asks to create or modify an application and its intended purpose is sufficiently specific.
+3. The platform asks only for unresolved decisions, such as one-shot versus multi-turn interaction, required Skills/Tools/knowledge bases, and Crew versus Flow. Decisions already present in the request are skipped.
+4. Input confirmation defines the published input contract. Platform applications normally include a required long-text `message` field for the user's request, with file, number, Boolean, and JSON fields added only when needed.
+5. Architecture confirmation defines Agent roles, Tasks, node dependencies, and variable sources. A downstream node may reference only confirmed published inputs or outputs from its upstream nodes.
+6. The generation stage turns the design into an executable definition, validates variable contracts and resources, and corrects the generated manifest when review finds a problem.
+7. Confirmation saves a draft. Publishing creates an immutable release snapshot, so active applications are unaffected by later draft edits.
+8. Run requests enter a Redis queue. Workers execute them and persist node status, approvals, files, and event cursors.
 
-### Crew 与 Flow 如何选择
+### Choosing Crew or Flow
 
-| 场景 | 建议 |
+| Scenario | Recommended option |
 | --- | --- |
-| 一次性完成研究、写作、审查等顺序协作 | `Crew` + `sequential` |
-| 需要负责人分配任务或层级管理 | `Crew` + `hierarchical` |
-| 需要条件分支、循环、人工审批 | `Flow` |
-| 需要多轮追问并暂停恢复 | `Flow`，或在 Crew 的 Agent 上显式启用 `ask_user` |
-| 需要多个 Crew 串联 | `Flow` |
+| One-shot sequential collaboration such as research, writing, and review | `Crew` + `sequential` |
+| A manager should delegate work through a hierarchy | `Crew` + `hierarchical` |
+| Conditional branches, loops, or human approvals are required | `Flow` |
+| The application must ask follow-up questions and pause/resume | `Flow`, or a Crew Agent with `ask_user` explicitly enabled |
+| Several Crews must be chained together | `Flow` |
 
-多轮模式不是自动把所有节点变成 Flow；只有绑定平台 `ask_user` 的 Agent 才能提问。平台消息通过会话通道传入，不会被错误地当作用户自定义运行输入变量。
+Multi-turn mode does not automatically convert every node into a Flow. Only an Agent bound to the platform `ask_user` tool can ask the user a question. Conversation messages are delivered through the platform message channel and are not treated as arbitrary custom run inputs.
 
-## 快速开始（Docker）
+## Quick Start with Docker
 
-### 1. 准备环境
+### 1. Prerequisites
 
-需要 Docker Engine 24+、Docker Compose v2、可访问的聊天模型 API，以及至少 4 GB 可用内存（构建依赖建议 8 GB）。
+You need Docker Engine 24+, Docker Compose v2, access to a chat-model API, and at least 4 GB of available memory. Eight GB is recommended while building dependencies.
 
-### 2. 创建配置
+### 2. Configure the Environment
 
 ```bash
 cd xuanshu_platform
 cp .env.example .env
 ```
 
-生产环境至少修改：
+At minimum, change these values for production:
 
 ```dotenv
-POSTGRES_PASSWORD=<数据库密码>
-MINIO_SECRET_KEY=<对象存储密码>
-JWT_SECRET=<至少32字符的随机密钥>
-ENCRYPTION_KEY=<Fernet 密钥>
-ADMIN_PASSWORD=<至少12字符的管理员密码>
-EXECUTOR_SHARED_SECRET=<至少24字符的随机密钥>
-OPENAI_API_KEY=<可选：默认模型 API Key>
+POSTGRES_PASSWORD=<database-password>
+MINIO_SECRET_KEY=<object-storage-password>
+JWT_SECRET=<random-string-with-at-least-32-characters>
+ENCRYPTION_KEY=<fernet-key>
+ADMIN_PASSWORD=<administrator-password-with-at-least-12-characters>
+EXECUTOR_SHARED_SECRET=<random-string-with-at-least-24-characters>
+OPENAI_API_KEY=<optional-default-model-api-key>
 OPENAI_MODEL=gpt-4o-mini
 ```
 
-`OPENAI_*` 只是默认模型配置；其他供应商可以启动后从“模型连接”添加 Base URL、模型名和密钥。不要把密钥提交到 Git、截图或日志。
+The `OPENAI_*` variables configure only the initial default model. Other providers can be added after startup from **Model Connections** using their Base URL, model name, and credentials. Never commit credentials to Git or expose them in screenshots or logs.
 
-### 3. 启动
+### 3. Start the Stack
 
 ```bash
 docker compose up --build -d
 docker compose ps
 ```
 
-默认地址：
+Default endpoints:
 
-- 前端：<http://localhost:8012>
-- 健康检查：<http://localhost:18112/api/health>
-- OpenAPI：<http://localhost:18112/docs>
+- Frontend: <http://localhost:8012>
+- Health check: <http://localhost:18112/api/health>
+- OpenAPI: <http://localhost:18112/docs>
 
-第一次启动会初始化数据库、工作目录和管理员用户。账号来自 `ADMIN_USERNAME`、`ADMIN_PASSWORD`，并自动拥有主工作空间。
+On first startup, XuanShu initializes the database, workspace directories, and administrator account. Credentials come from `ADMIN_USERNAME` and `ADMIN_PASSWORD`; that account automatically owns the primary workspace.
 
-生产数据直接保存在项目目录下：`data/postgres`、`data/redis`、`data/minio`、`data/qdrant` 和 `data/workspaces`。这些目录已加入 Git 忽略规则，Compose 的 `data-init` 服务会在首次启动时自动创建并设置权限；不要把运行数据提交到 GitHub。
+Production data is stored inside the project under `data/postgres`, `data/redis`, `data/minio`, `data/qdrant`, and `data/workspaces`. These directories are ignored by Git. The Compose `data-init` service creates them and sets their permissions on first startup. Do not commit runtime data to GitHub.
 
-### 4. 第一次使用
+### 4. First Run
 
-1. 登录管理员账号。
-2. 在“模型连接”添加或测试模型，并设置默认模型。
-3. 在“Skills & Tools”导入 Skill、创建工具，或在“知识库”上传文件并等待索引完成。
-4. 进入“智能体编辑”或“玄枢编排台”，使用自然语言或画布创建 Crew/Flow。
-5. 确认输入、Agent、Task、依赖和资源，保存草稿并点击“发布”。
-6. 通过“运行智能体”或公开 URL 试运行。
+1. Sign in with the administrator account.
+2. Add or test a model connection and select the default model.
+3. Import a Skill, create a Tool under **Skills & Tools**, or upload documents to a knowledge base and wait for indexing to complete.
+4. Open **Agent Editor** or **XuanShu Studio**, then create a Crew/Flow with natural language or the canvas.
+5. Confirm inputs, Agents, Tasks, dependencies, and resources; save the draft and publish it.
+6. Test the application from **Run Agents** or its public URL.
 
-## 开发模式
+## Development Mode
 
-开发覆盖配置把源码映射进容器，数据卷仍复用生产 Compose 定义：
+The development override mounts source code into the containers while reusing the data volumes from the production Compose definition:
 
 ```bash
 docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d --no-build
 ```
 
-修改后端、Worker 或 executor 后重启：
+Restart backend services after changing the backend, Worker, or executor:
 
 ```bash
 docker compose -f docker-compose.yml -f docker-compose.dev.yml \
   restart backend worker studio-worker executor
 ```
 
-前端使用 Vite 热更新，依赖安装在项目内的 `data/frontend-node-modules`；依赖变化时重新构建：
+The frontend uses Vite hot reload, and its dependencies are stored under `data/frontend-node-modules`. Rebuild the frontend when its dependencies change:
 
 ```bash
 docker compose -f docker-compose.yml -f docker-compose.dev.yml \
   up -d --build frontend
 ```
 
-日志：
+Follow logs with:
 
 ```bash
 docker compose logs -f backend
@@ -180,33 +184,33 @@ docker compose logs -f studio-worker worker
 docker compose logs -f executor
 ```
 
-停止服务但保留数据卷：
+Stop services while retaining persisted data:
 
 ```bash
 docker compose down
 ```
 
-不要在没有备份时使用 `docker compose down -v`，它会删除 PostgreSQL、Redis、MinIO、Qdrant 和应用工作目录数据。
+Do not run `docker compose down -v` without a backup. It removes PostgreSQL, Redis, MinIO, Qdrant, and application-workspace data.
 
-## 公开应用 API
+## Public Application API
 
-发布应用后有两个入口：
+A published application provides two entry points:
 
-- `/public/{public_token}`：无需登录的匿名聊天页面。
-- `/api/v1/apps/{public_token}`：使用应用 API Key 的程序接口。
+- `/public/{public_token}`: anonymous public chat page.
+- `/api/v1/apps/{public_token}`: API-key-protected programmatic interface.
 
-### 上传并运行
+### Upload a File and Start a Run
 
 ```bash
 curl -X POST "http://localhost:18112/api/v1/apps/<PUBLIC_TOKEN>/files" \
-  -F "file=@./合同.docx"
+  -F "file=@./contract.docx"
 
 curl -X POST "http://localhost:18112/api/v1/apps/<PUBLIC_TOKEN>/runs" \
   -H "Authorization: Bearer xsk_<API_KEY>" \
   -H "Content-Type: application/json" \
   -d '{
     "inputs": {
-      "message": "请审查这份合同，重点关注付款、违约和到期条款"
+      "message": "Review this contract, focusing on payment, breach, and expiration clauses."
     },
     "files": {
       "contract_files": ["<UPLOAD_ID>"]
@@ -216,62 +220,62 @@ curl -X POST "http://localhost:18112/api/v1/apps/<PUBLIC_TOKEN>/runs" \
   }'
 ```
 
-`inputs` 和 `files` 的键必须使用发布版本中的英文变量名。首次请求可省略 `user_id` 和 `conversation_id`；多轮应用在 `waiting_input` 后继续使用同一会话即可恢复。
+Keys under `inputs` and `files` must match the English variable names in the published input contract. `user_id` and `conversation_id` may be omitted on the first request. To resume a multi-turn application after `waiting_input`, continue with the same conversation.
 
-| 方法 | 路径 | 用途 |
+| Method | Path | Purpose |
 | --- | --- | --- |
-| `GET` | `/api/v1/apps/{token}` | 公开应用描述和输入契约 |
-| `POST` | `/api/v1/apps/{token}/files` | 上传临时文件 |
-| `POST` | `/api/v1/apps/{token}/runs` | 创建运行 |
-| `GET` | `/api/v1/apps/{token}/runs/{run_id}` | 查询状态、节点输出和文件 |
-| `GET` | `/api/v1/apps/{token}/runs/{run_id}/events` | SSE 事件流 |
-| `POST` | `/api/v1/apps/{token}/runs/{run_id}/approval` | 提交审批 |
-| `GET` | `/api/v1/apps/{token}/runs/{run_id}/files/{path}` | 下载交付文件 |
+| `GET` | `/api/v1/apps/{token}` | Get the public application description and input contract |
+| `POST` | `/api/v1/apps/{token}/files` | Upload a temporary file |
+| `POST` | `/api/v1/apps/{token}/runs` | Create a run |
+| `GET` | `/api/v1/apps/{token}/runs/{run_id}` | Get status, node outputs, and files |
+| `GET` | `/api/v1/apps/{token}/runs/{run_id}/events` | Stream events with SSE |
+| `POST` | `/api/v1/apps/{token}/runs/{run_id}/approval` | Submit an approval decision |
+| `GET` | `/api/v1/apps/{token}/runs/{run_id}/files/{path}` | Download a generated file |
 
-完整接口见 [`docs/API.md`](docs/API.md)。
+See [`docs/API.md`](docs/API.md) for the complete API reference.
 
-## 资源与执行安全
+## Resources and Execution Security
 
-- 应用、Agent、Task、输入、运行、模型和资源均归属于工作空间。
-- 模型 API Key、HTTP/MCP token 和 headers 加密保存；管理 API 不返回密钥原文。
-- Skill 使用标准 package 目录并由 Agent 按需加载。
-- Python、Shell 和 Skill 脚本只通过 executor 执行，工作目录固定为 `/var/lib/xuanshu/workspaces`。
-- executor 默认只读根文件系统、丢弃 capabilities、禁止提权，并限制 CPU、内存、进程数和执行时间。
-- MCP 只支持远程 Streamable HTTP 或 SSE，不提供 stdio 绕过边界。
-- 上传对象、外部会话和对话历史按 `.env` 保留策略清理。
-- 发布应用读取发布快照；草稿编辑不会改变已发布版本。
+- Applications, Agents, Tasks, inputs, runs, model connections, and resources belong to a workspace.
+- Model API keys and HTTP/MCP tokens and headers are encrypted at rest; management APIs never return plaintext credentials.
+- Skills use the standard package layout and are loaded by Agents only when required.
+- Python, Shell, and Skill scripts run only through the executor, whose workspace root is `/var/lib/xuanshu/workspaces`.
+- By default, the executor has a read-only root filesystem, dropped capabilities, no privilege escalation, and CPU, memory, process-count, and execution-time limits.
+- MCP connections support only remote Streamable HTTP or SSE; stdio cannot bypass the isolation boundary.
+- Uploaded objects, external sessions, and conversation history are cleaned according to the retention settings in `.env`.
+- Published applications execute immutable release snapshots; editing a draft does not alter an existing release.
 
-启用代码执行时，请只绑定给可信 Agent，并限制 Skill、Tool 和环境变量权限。
+Enable code execution only for trusted Agents, and restrict the Skills, Tools, and environment variables available to them.
 
-## 项目结构
+## Repository Layout
 
 ```text
 xuanshu_platform/
 ├── src/xuanshu_platform/
-│   ├── api.py              # FastAPI 路由、认证、Studio、公开 API
-│   ├── composer.py         # 持久化编排 Flow 与阶段状态
-│   ├── runtime.py          # Crew/Flow 运行时、依赖、输出和检查点
-│   ├── model_runtime.py    # 模型配置、调用参数和输出解析
-│   ├── db.py               # PostgreSQL SQLAlchemy 模型
-│   ├── persistence.py      # 应用图读写与发布快照
-│   ├── knowledge.py        # 知识库解析、切片和检索
-│   ├── resources.py        # Skill、Tool 和应用资源物化
-│   ├── tools/builtin.py    # ask_user、文件和隔离执行工具
-│   └── builtin_resources/  # 平台内置 Skill 与工具
-├── worker/                 # 应用 Worker 和 Studio Worker
-├── executor/               # 独立隔离执行服务
-├── frontend/src/           # Vue 3 + Pinia + Vue Router
-├── docs/API.md             # 公开 API 参考
-├── docs/screenshots/       # README 界面截图
-├── data/                   # Docker 持久化数据（不提交实际内容）
-├── docker-compose.yml      # 生产 Compose
-├── docker-compose.dev.yml  # 源码映射开发覆盖配置
-└── pyproject.toml          # Python 依赖和 CrewAI Flow 配置
+│   ├── api.py              # FastAPI routes, auth, Studio, and public API
+│   ├── composer.py         # Persistent orchestration Flow and stage state
+│   ├── runtime.py          # Crew/Flow runtime, dependencies, outputs, checkpoints
+│   ├── model_runtime.py    # Model settings, invocation parameters, output parsing
+│   ├── db.py               # PostgreSQL SQLAlchemy models
+│   ├── persistence.py      # Application graph storage and release snapshots
+│   ├── knowledge.py        # Knowledge parsing, chunking, and retrieval
+│   ├── resources.py        # Materialization of Skills, Tools, and app resources
+│   ├── tools/builtin.py    # ask_user, file, spreadsheet, and isolated-run tools
+│   └── builtin_resources/  # Built-in Skills and Tool definitions
+├── worker/                 # Application Worker and Studio Worker
+├── executor/               # Separate isolated execution service
+├── frontend/src/           # Vue 3, Pinia, and Vue Router frontend
+├── docs/API.md             # Public API reference
+├── docs/screenshots/       # README screenshots
+├── data/                   # Docker persistent data (runtime content is ignored)
+├── docker-compose.yml      # Production Compose definition
+├── docker-compose.dev.yml  # Source-mounted development override
+└── pyproject.toml          # Python dependencies and CrewAI Flow configuration
 ```
 
-## 部署检查
+## Deployment Checks
 
-项目发布包不包含测试代码和本地开发缓存。部署后可用以下命令确认服务状态：
+The open-source package does not include test code or local development caches. After deployment, verify the services with:
 
 ```bash
 curl http://localhost:18112/api/health
@@ -279,44 +283,46 @@ docker compose ps
 docker compose logs --tail=100 backend worker studio-worker executor
 ```
 
-## 常见问题
+## Troubleshooting
 
-### 修改源码后没有变化
+### Source Changes Do Not Appear
 
-确认使用开发覆盖文件：
+Make sure the development override is active:
 
 ```bash
 docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d --no-build
 ```
 
-后端和 Worker 修改后需要重启；依赖、Dockerfile 或前端依赖变化需要重新构建。
+Backend and Worker source changes require a restart. Dependency, Dockerfile, and frontend dependency changes require a rebuild.
 
-### 运行停在队列或没有节点输出
+### A Run Remains Queued or Produces No Node Output
 
-查看 `backend`、`worker`、`studio-worker` 和 `executor` 日志，确认 Redis、PostgreSQL、MinIO、Qdrant 和 executor healthy，并检查模型 Base URL、API Key、超时和模型名。
+Inspect the `backend`, `worker`, `studio-worker`, and `executor` logs. Verify that Redis, PostgreSQL, MinIO, Qdrant, and executor are healthy, then check the model Base URL, API key, timeout, and model name.
 
-### 缺少输入变量
+### Missing Input Variables
 
-输入键必须匹配发布版本的英文变量名。确认 `message`、文件变量和必填项；编辑画布后需要重新保存并发布。
+Input keys must match the English variable names in the published release. Verify `message`, file fields, and required fields. Save and publish again after editing the canvas.
 
-### 多轮应用没有提问
+### A Multi-Turn Application Does Not Ask Questions
 
-确认应用为 `multi_turn`，且某个 Agent 显式绑定 `ask_user`。仅选择 Flow 不会自动开启用户提问。
+Verify that the application uses `multi_turn` and that an Agent is explicitly bound to `ask_user`. Selecting Flow alone does not enable user interaction.
 
-### 生成文件找不到
+### Generated Files Cannot Be Found
 
-文件必须写入 `$XUANSHU_WORKSPACE`，平台从 executor 工作目录收集交付物。不要硬编码宿主机路径，也不要只在文本中返回本地路径。
+Files must be written under `$XUANSHU_WORKSPACE`, where the platform collects executor artifacts. Do not hard-code a host path or return only a local path as text.
 
-### 数据迁移或密钥错误
+### Database Migration or Credential Errors
 
-`schema-init` 负责初始化和迁移数据库结构；生产弱密钥会在初始化时被拒绝。修改 `.env` 后重启相关服务，不要删除数据卷来“解决”配置问题。
+`schema-init` initializes and migrates the database schema. Weak production credentials are rejected during initialization. After changing `.env`, restart the affected services; do not delete data volumes as a configuration workaround.
 
-## 相关文档
+## Documentation
 
-- [`docs/API.md`](docs/API.md)：公开 API、会话、SSE、审批和文件下载。
-- [`docs/LEGACY_PARITY.md`](docs/LEGACY_PARITY.md)：功能迁移矩阵与运行语义。
-- [`AGENTS.md`](AGENTS.md)：CrewAI 版本、代码模式和开发约束。
-- [CrewAI 官方文档](https://docs.crewai.com/)：Agent、Task、Crew、Flow、Skill 和 Tool 参考。
+- [`docs/API.md`](docs/API.md): public API, conversations, SSE, approvals, and file downloads.
+- [`docs/LEGACY_PARITY.md`](docs/LEGACY_PARITY.md): feature migration matrix and runtime semantics.
+- [CrewAI documentation](https://docs.crewai.com/): Agent, Task, Crew, Flow, Skill, and Tool reference.
 
-## 联系我
-VX:a1269586480
+## License and Deployment Notes
+
+This project is licensed under the [Apache License 2.0](LICENSE).
+
+Before exposing a deployment to the internet, review the compliance requirements for model providers, uploaded files, knowledge-base content, Traces, and logs. Enable HTTPS at the reverse proxy, restrict access to administrative endpoints, and configure backups.
