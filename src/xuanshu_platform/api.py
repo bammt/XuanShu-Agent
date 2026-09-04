@@ -1,4 +1,4 @@
-import ast, asyncio, hashlib, io, json, logging, mimetypes, re, secrets, shutil
+import ast, asyncio, base64, binascii, hashlib, io, json, logging, mimetypes, re, secrets, shutil
 from datetime import UTC, datetime, timedelta
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -6,7 +6,7 @@ from urllib.parse import quote, urlparse
 from fastapi import Body, Cookie, Depends, FastAPI, File, Form, Header, HTTPException, Response, UploadFile
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from pwdlib import PasswordHash
 import jwt
 from crewai import Agent
@@ -95,15 +95,26 @@ class RunFeedbackIn(BaseModel): outcome: str; feedback: str = ''
 def skill_document(row: Skill) -> dict:
     data = row.content if isinstance(row.content, dict) else {}
     if data.get('instructions') is not None:
-        return {'id': str(row.id), **data}
+        return {
+            'id': str(row.id),
+            'revision': int(getattr(row, 'revision', 1) or 1),
+            'updated_at': (
+                getattr(row, 'updated_at', None)
+                or datetime.now(UTC).replace(tzinfo=None)
+            ).isoformat(),
+            **data,
+        }
     return {'id': str(row.id), 'name': row.name, 'slug': safe_name(row.name).lower(), 'description': row.description,
-            'instructions': '', 'category': 'Custom', 'version': '1.0.0', 'author': 'local',
-            'source': 'local', 'registry_ref': '', 'files': [], 'enabled': True, 'status': 'published'}
+            'instructions': '', 'version': '1.0.0', 'author': 'local',
+            'source': 'local', 'registry_ref': '', 'files': [], 'enabled': True, 'status': 'published',
+            'revision': int(getattr(row, 'revision', 1) or 1),
+            'updated_at': (getattr(row, 'updated_at', None) or datetime.now(UTC).replace(tzinfo=None)).isoformat()}
 
 ALLOWED_PLUGIN_KINDS = {'http', 'python', 'mcp_http', 'mcp_sse', 'app'}
 
 def plugin_document(row: Plugin, *, runtime: bool = False) -> dict:
     configuration = (runtime_plugin_configuration if runtime else public_plugin_configuration)(row.configuration)
+    configuration.pop('category', None)
     return {'id': str(row.id), 'name': row.name, 'kind': row.kind, **configuration}
 
 def validate_plugin_document(body: dict) -> None:
@@ -155,6 +166,16 @@ class StudioChatIn(BaseModel):
     # document so a later Composer turn can distinguish confirmed manual
     # changes from the older conversational proposal.
     manual_changes: list[dict] = []
+
+    @field_validator('orchestration_id', mode='before')
+    @classmethod
+    def normalize_orchestration_id(cls, value):
+        # Application ids are numeric in PostgreSQL, while unbound Studio
+        # sessions use opaque string ids. Keep one transport type and accept
+        # requests from browser tabs loaded before that frontend fix.
+        if isinstance(value, int) and not isinstance(value, bool):
+            return str(value)
+        return value
 
 class StudioSessionUpdate(BaseModel):
     proposal: dict | None = None
@@ -1553,6 +1574,7 @@ def workflow_document(row: Application, definition: dict | None = None) -> dict:
         'model_profile_id': definition.get('model_profile_id'),
         'status': 'published' if row.published else 'draft',
         'published': bool(row.published),
+        'draft_revision': int(getattr(row, 'draft_revision', 1) or 1),
         'public_token': row.public_token,
         'agents': definition.get('agents', []),
         'tasks': definition.get('tasks', []),
@@ -1570,8 +1592,8 @@ def workflow_document(row: Application, definition: dict | None = None) -> dict:
         'tools': definition.get('tools', []),
         'draft_sync': definition.get('draft_sync', {}),
         'structure_confirmed': definition.get('structure_confirmed', True),
-        'created_at': row.created_at.isoformat(),
-        'updated_at': row.updated_at.isoformat(),
+        'created_at': (row.created_at or datetime.now(UTC).replace(tzinfo=None)).isoformat(),
+        'updated_at': (row.updated_at or datetime.now(UTC).replace(tzinfo=None)).isoformat(),
     }
     normalize_legacy_studio_references(document)
     document['execution_graph'] = execution_graph(document)
@@ -1582,7 +1604,8 @@ def workflow_definition(document: dict) -> dict:
     # regenerate the graph so canvas, code generation and runtime cannot drift.
     excluded = {
         'id', 'name', 'kind', 'status', 'published', 'created_at', 'updated_at',
-        'execution_graph', '_manual_changes',
+        'execution_graph', 'draft_revision', 'studio_session', 'chat_history',
+        '_manual_changes', '_base_revision',
     }
     return {key: value for key, value in document.items() if key not in excluded}
 
@@ -1939,6 +1962,119 @@ async def normalize_application_resources(db, workspace_id: int, definition: dic
     ]
     return result
 
+
+async def persist_application_draft(
+    db,
+    workspace_id: int,
+    document: dict,
+    *,
+    application: Application | None = None,
+    session: DesignSession | None = None,
+    manual_changes: list[dict] | None = None,
+    expected_revision: int | None = None,
+) -> tuple[Application, dict]:
+    """Validate and persist one authoritative application draft.
+
+    Both canvas saves and Composer generation use this function so a generated
+    graph cannot exist only in ``DesignSession.active_job``. The caller owns
+    the transaction and decides when to commit.
+    """
+    name = workflow_name(document)
+    kind = str(document.get('kind') or 'crew')
+    if kind not in {'crew', 'flow'}:
+        raise HTTPException(422, '编排类型必须是 crew 或 flow')
+    definition = workflow_definition(document)
+    normalize_legacy_studio_references(definition)
+    definition['inputs'] = normalize_studio_input_contract(
+        definition.get('inputs', []), definition.get('interaction_mode'),
+    )
+    if not definition.get('tasks'):
+        raise HTTPException(422, '应用至少需要一个可执行 Task')
+    if kind == 'crew' and not definition.get('agents'):
+        raise HTTPException(422, 'Crew 应用至少需要一个 Agent')
+    ensure_message_task_reference(definition)
+    ensure_variable_contract(definition)
+    definition = await normalize_application_resources(db, workspace_id, definition)
+    try:
+        validated = ApplicationDefinition.model_validate(definition)
+    except Exception as exc:
+        raise HTTPException(422, f'应用编排无效：{exc}') from exc
+    await validate_application_resources(db, workspace_id, validated)
+
+    row = application
+    if row and row.workspace_id != workspace_id:
+        raise HTTPException(403, '应用不属于当前工作空间')
+    if row and expected_revision is not None:
+        current_revision = int(getattr(row, 'draft_revision', 1) or 1)
+        if current_revision != expected_revision:
+            raise HTTPException(
+                409,
+                '应用草稿已被其他操作更新，请刷新后在最新画布上继续修改',
+            )
+    old_kind = row.kind if row else kind
+    if not row:
+        row = Application(
+            workspace_id=workspace_id,
+            name=name,
+            kind=kind,
+            draft_revision=1,
+        )
+        db.add(row)
+        await db.flush()
+    else:
+        row.draft_revision = int(getattr(row, 'draft_revision', 1) or 1) + 1
+    if row.published and not getattr(row, 'published_config', None):
+        row.published_config = await read_application(db, row)
+
+    sync_definition = {
+        **definition,
+        'name': name,
+        'kind': kind,
+        'description': document.get('description', ''),
+    }
+    definition['draft_sync'] = draft_sync_document(sync_definition, manual_changes)
+    row.name = name
+    row.kind = kind
+    row.updated_at = datetime.now(UTC).replace(tzinfo=None)
+    await write_application(db, row, definition)
+
+    app_root = relocate_app_root(workspace_id, row.id, old_kind, kind)
+    selected_skill_ids = {
+        str(skill_id) for agent in validated.agents for skill_id in agent.skills
+        if str(skill_id).isdigit()
+    }
+    skill_rows = (await db.scalars(select(Skill).where(
+        Skill.workspace_id == workspace_id,
+        Skill.id.in_([int(skill_id) for skill_id in selected_skill_ids])
+        if selected_skill_ids else text('false'),
+    ))).all()
+    materialize_application_resources(
+        app_root,
+        {str(item.id): skill_document(item) for item in skill_rows},
+        selected_skill_ids,
+        include_code=any(agent.allow_code_execution for agent in validated.agents),
+        refresh=True,
+    )
+
+    if session:
+        bound = await db.scalar(select(DesignSession).where(
+            DesignSession.application_id == row.id,
+            DesignSession.id != session.id,
+        ))
+        if bound:
+            raise HTTPException(409, '该应用已经绑定另一条编排会话')
+        session.application_id = row.id
+        session.status = 'generated'
+    await sync_design_sessions_for_application(
+        db, row.id, sync_definition, manual_changes,
+    )
+    await db.flush()
+    return row, workflow_document(row, {
+        **definition,
+        'name': name,
+        'kind': kind,
+    })
+
 async def model_usage_count(db, workspace_id: int, model_id: int) -> int:
     """Count applications that reference a model in application or agent settings."""
     applications = (await db.scalars(select(Application).where(Application.workspace_id == workspace_id))).all()
@@ -2029,7 +2165,14 @@ async def persist_studio_job_failure(job_id: str, session_id: str, workspace_id:
         failed['workflow'] = result['workflow']
     async with SessionLocal() as db:
         row = await db.get(DesignSession, session_id)
-        if row and row.workspace_id == workspace_id and row.user_id == user_id:
+        if not row and str(session_id).isdigit():
+            row = await db.scalar(select(DesignSession).where(
+                DesignSession.application_id == int(session_id),
+                DesignSession.workspace_id == workspace_id,
+            ))
+        active = dict(row.active_job or {}) if row else {}
+        if (row and row.workspace_id == workspace_id
+                and (not active.get('job_id') or active.get('job_id') == job_id)):
             messages = list(row.messages or [])
             message_index = next(
                 (index for index in range(len(messages) - 1, -1, -1)
@@ -2614,16 +2757,25 @@ async def run_studio_job(job_id: str, body: StudioChatIn, workspace_id: int, use
                 row = await db.scalar(select(DesignSession).where(
                     DesignSession.application_id == int(body.orchestration_id),
                     DesignSession.workspace_id == workspace_id,
-                    DesignSession.user_id == user_id,
                 ))
             application = None
             if str(body.orchestration_id).isdigit():
                 application = await db.get(Application, int(body.orchestration_id))
                 if application and application.workspace_id != workspace_id:
                     raise HTTPException(403, '应用不属于当前工作空间')
+            if not application and row and row.application_id:
+                application = await db.get(Application, row.application_id)
             if not row:
                 row = DesignSession(id=body.orchestration_id, workspace_id=workspace_id, user_id=user_id)
                 db.add(row)
+            active = dict(row.active_job or {})
+            # A superseded worker must never overwrite a newer user turn.
+            if active.get('request') and active.get('job_id') and (
+                active.get('job_id') != job_id
+                or active.get('status') not in {'queued', 'planning'}
+            ):
+                logging.info('ignoring superseded studio job %s for session %s', job_id, row.id)
+                return
             if application and row.application_id is None:
                 row.application_id = application.id
                 row.title = application.name
@@ -2635,6 +2787,22 @@ async def run_studio_job(job_id: str, body: StudioChatIn, workspace_id: int, use
                 proposal_data = {
                     **proposal_data,
                     'draft_sync': draft_sync_document(sync_source, manual_changes),
+                }
+                result['proposal'] = proposal_data
+            if result.get('workflow'):
+                application, saved_workflow = await persist_application_draft(
+                    db,
+                    workspace_id,
+                    result['workflow'],
+                    application=application,
+                    session=row,
+                    manual_changes=manual_changes,
+                )
+                result['workflow'] = saved_workflow
+                last_workflow = saved_workflow
+                proposal_data = {
+                    **proposal_data,
+                    'draft_sync': saved_workflow.get('draft_sync', {}),
                 }
                 result['proposal'] = proposal_data
             if not conversation_only:
@@ -2790,11 +2958,12 @@ async def _studio_chat_locked(body: StudioChatIn, x_workspace_id: int, user: Use
                     row = await db.scalar(select(DesignSession).where(
                         DesignSession.application_id == application.id,
                         DesignSession.workspace_id == x_workspace_id,
-                        DesignSession.user_id == user.id,
-                    ).order_by(DesignSession.updated_at.desc()).limit(1))
+                    ))
             if not row:
                 row = await db.get(DesignSession, body.orchestration_id)
-            if row and (row.workspace_id != x_workspace_id or row.user_id != user.id):
+            if row and (row.workspace_id != x_workspace_id or (
+                not row.application_id and row.user_id != user.id
+            )):
                 raise HTTPException(403, '编排会话不属于当前工作空间')
             if is_legacy_conversation_only_session(row):
                 mark_studio_conversation_only(row)
@@ -2820,6 +2989,7 @@ async def _studio_chat_locked(body: StudioChatIn, x_workspace_id: int, user: Use
             if row.title == '未命名智能体':
                 row.title = body.message.strip().splitlines()[0][:80]
             row.active_job = {'job_id': '', 'status': 'answered', 'result': result,
+                              'requested_by_user_id': user.id,
                               'updated_at': datetime.now(UTC).replace(tzinfo=None).isoformat()}
             await db.commit()
         return result
@@ -2836,11 +3006,12 @@ async def _studio_chat_locked(body: StudioChatIn, x_workspace_id: int, user: Use
                 row = await db.scalar(select(DesignSession).where(
                     DesignSession.application_id == application.id,
                     DesignSession.workspace_id == x_workspace_id,
-                    DesignSession.user_id == user.id,
-                ).order_by(DesignSession.updated_at.desc()).limit(1))
+                ))
         if not row:
             row = await db.get(DesignSession, body.orchestration_id)
-        if row and (row.workspace_id != x_workspace_id or row.user_id != user.id):
+        if row and (row.workspace_id != x_workspace_id or (
+            not row.application_id and row.user_id != user.id
+        )):
             raise HTTPException(403, '编排会话不属于当前工作空间')
         if row and (row.active_job or {}).get('status') in {'queued', 'planning'}:
             raise HTTPException(409, '当前编排会话仍有任务在运行，请等待完成后再发送')
@@ -2881,12 +3052,14 @@ async def _studio_chat_locked(body: StudioChatIn, x_workspace_id: int, user: Use
         row.messages = messages
         row.active_job = {'job_id': job_id, 'status': 'queued', 'result': {},
                           'request': request.model_dump(),
+                          'requested_by_user_id': user.id,
                           'updated_at': datetime.now(UTC).replace(tzinfo=None).isoformat()}
         row.status = 'draft'
+        queue_session_id = row.id
         await db.commit()
     try:
         await redis.set(f'xuanshu:studio:job:{job_id}', json.dumps({**pending, '_owner_user_id': user.id}, ensure_ascii=False), ex=3600)
-        await redis.lpush(STUDIO_QUEUE, body.orchestration_id)
+        await redis.lpush(STUDIO_QUEUE, queue_session_id)
     except Exception as exc:
         await persist_studio_job_failure(
             job_id, body.orchestration_id, x_workspace_id, user.id,
@@ -2898,39 +3071,38 @@ async def _studio_chat_locked(body: StudioChatIn, x_workspace_id: int, user: Use
 @app.get('/api/studio/jobs/{job_id}')
 async def studio_job(job_id: str, user: User = Depends(current_user)):
     raw = await redis.get(f'xuanshu:studio:job:{job_id}')
+    if raw and json.loads(raw).get('_owner_user_id') == user.id:
+        document = json.loads(raw)
+        document.pop('_owner_user_id', None)
+        return document
+    async with SessionLocal() as db:
+        row = await db.scalar(select(DesignSession).where(
+            DesignSession.active_job['job_id'].astext == job_id,
+        ))
+        if row:
+            await workspace_member(db, row.workspace_id, user.id)
+            active = dict(row.active_job or {})
+            active.pop('request', None)
+            return active.get('result') or {
+                'intent': 'orchestrate', 'phase': active.get('status', 'queued'),
+                'job_id': job_id, 'reply': '',
+            }
     if not raw:
-        async with SessionLocal() as db:
-            row = await db.scalar(select(DesignSession).where(
-                DesignSession.user_id == user.id,
-                DesignSession.active_job['job_id'].astext == job_id,
-            ))
-            if row:
-                active = dict(row.active_job or {})
-                active.pop('request', None)
-                return active.get('result') or {
-                    'intent': 'orchestrate', 'phase': active.get('status', 'queued'),
-                    'job_id': job_id, 'reply': '',
-                }
         raise HTTPException(404, '编排任务不存在或已过期')
-    document = json.loads(raw)
-    if document.pop('_owner_user_id', None) != user.id:
-        raise HTTPException(404, '编排任务不存在或已过期')
-    return document
+    raise HTTPException(404, '编排任务不存在或已过期')
 
 @app.get('/api/studio/jobs/{job_id}/events')
 async def studio_job_events(job_id: str, user: User = Depends(current_user)):
     key = f'xuanshu:studio:job:{job_id}'
     raw = await redis.get(key)
-    if not raw:
+    if not raw or json.loads(raw).get('_owner_user_id') != user.id:
         async with SessionLocal() as db:
             row = await db.scalar(select(DesignSession).where(
-                DesignSession.user_id == user.id,
                 DesignSession.active_job['job_id'].astext == job_id,
             ))
-        if not row:
-            raise HTTPException(404, '编排任务不存在或已过期')
-    elif json.loads(raw).get('_owner_user_id') != user.id:
-        raise HTTPException(404, '编排任务不存在或已过期')
+            if not row:
+                raise HTTPException(404, '编排任务不存在或已过期')
+            await workspace_member(db, row.workspace_id, user.id)
     async def stream():
         cursor = 0
         while True:
@@ -2947,7 +3119,6 @@ async def studio_job_events(job_id: str, user: User = Depends(current_user)):
             else:
                 async with SessionLocal() as db:
                     row = await db.scalar(select(DesignSession).where(
-                        DesignSession.user_id == user.id,
                         DesignSession.active_job['job_id'].astext == job_id,
                     ))
                     active = dict(row.active_job or {}) if row else {}
@@ -3006,13 +3177,24 @@ def design_session_document(row: DesignSession, *, detail: bool = False) -> dict
         })
     return result
 
+
+async def resolve_design_session(db, identifier: str | int) -> DesignSession | None:
+    """Resolve a real session id, or the unique session bound to an app id."""
+    value = str(identifier)
+    row = await db.get(DesignSession, value)
+    if not row and value.isdigit():
+        row = await db.scalar(select(DesignSession).where(
+            DesignSession.application_id == int(value),
+        ))
+    return row
+
 @app.get('/api/studio/sessions')
 async def studio_sessions(x_workspace_id: int = Header(alias='X-Workspace-Id'), user: User = Depends(current_user)):
     async with SessionLocal() as db:
         await workspace_member(db, x_workspace_id, user.id)
         rows = (await db.scalars(select(DesignSession).where(
             DesignSession.workspace_id == x_workspace_id,
-            DesignSession.user_id == user.id,
+            (DesignSession.application_id.is_not(None)) | (DesignSession.user_id == user.id),
         ).order_by(DesignSession.updated_at.desc()).limit(30))).all()
         return [design_session_document(row) for row in rows]
 
@@ -3039,20 +3221,24 @@ async def create_studio_session(body: StudioSessionCreate,
 @app.get('/api/studio/sessions/{session_id}')
 async def studio_session(session_id: str, user: User = Depends(current_user)):
     async with SessionLocal() as db:
-        row = await db.get(DesignSession, session_id)
-        if not row or row.user_id != user.id:
+        row = await resolve_design_session(db, session_id)
+        if not row:
             raise HTTPException(404, '编排会话不存在')
         await workspace_member(db, row.workspace_id, user.id)
+        if not row.application_id and row.user_id != user.id:
+            raise HTTPException(404, '编排会话不存在')
         return design_session_document(row, detail=True)
 
 @app.patch('/api/studio/sessions/{session_id}')
 async def update_studio_session(session_id: str, body: StudioSessionUpdate,
                                 user: User = Depends(current_user)):
     async with SessionLocal() as db:
-        row = await db.get(DesignSession, session_id)
-        if not row or row.user_id != user.id:
+        row = await resolve_design_session(db, session_id)
+        if not row:
             raise HTTPException(404, '编排会话不存在')
         await workspace_member(db, row.workspace_id, user.id, True)
+        if not row.application_id and row.user_id != user.id:
+            raise HTTPException(404, '编排会话不存在')
         if (row.active_job or {}).get('status') in {'queued', 'planning'}:
             raise HTTPException(409, '当前编排会话仍有任务在运行')
         if body.proposal is not None:
@@ -3306,7 +3492,14 @@ async def get_workflow(workflow_id: int, user: User = Depends(current_user)):
         if not row:
             raise HTTPException(404, '应用不存在')
         await workspace_member(db, row.workspace_id, user.id)
-        return workflow_document(row, await read_application(db, row))
+        document = workflow_document(row, await read_application(db, row))
+        session = await db.scalar(select(DesignSession).where(
+            DesignSession.application_id == row.id,
+        ))
+        document['studio_session'] = (
+            design_session_document(session, detail=True) if session else None
+        )
+        return document
 
 
 @app.get('/api/workflows/{workflow_id}/runtime')
@@ -3323,45 +3516,9 @@ async def get_runtime_workflow(workflow_id: int, user: User = Depends(current_us
 
 @app.post('/api/workflows')
 async def save_workflow(document: dict = Body(...), x_workspace_id: int = Header(alias='X-Workspace-Id'), user: User = Depends(current_user)):
-    name = workflow_name(document)
-    kind = document.get('kind', 'crew')
     manual_changes = normalize_manual_changes(document.get('_manual_changes'))
-    if kind not in {'crew', 'flow'}:
-        raise HTTPException(422, '编排类型必须是 crew 或 flow')
-    try:
-        definition = workflow_definition(document)
-        normalize_legacy_studio_references(definition)
-        definition['inputs'] = normalize_studio_input_contract(
-            definition.get('inputs', []), definition.get('interaction_mode'),
-        )
-        if not definition.get('tasks'):
-            raise ValueError('应用至少需要一个可执行 Task')
-        if kind == 'crew' and not definition.get('agents'):
-            raise ValueError('Crew 应用至少需要一个 Agent')
-        ensure_message_task_reference(definition)
-        ensure_variable_contract(definition)
-        # ``workflow_definition`` omits row-level fields such as name/kind;
-        # include them in the sync projection so the session card also follows
-        # a manual rename or Crew/Flow switch.
-        sync_definition = {
-            **definition,
-            'name': name,
-            'kind': kind,
-            'description': document.get('description', ''),
-        }
-        # Keep a bounded sync projection in the application config. The
-        # reserved request key is excluded from the persisted workflow itself.
-        definition['draft_sync'] = draft_sync_document(sync_definition, manual_changes)
-    except Exception as exc:
-        raise HTTPException(422, f'应用编排无效：{exc}') from exc
     async with SessionLocal() as db:
         await workspace_member(db, x_workspace_id, user.id, True)
-        definition = await normalize_application_resources(db, x_workspace_id, definition)
-        try:
-            validated = ApplicationDefinition.model_validate(definition)
-        except Exception as exc:
-            raise HTTPException(422, f'应用编排无效：{exc}') from exc
-        await validate_application_resources(db, x_workspace_id, validated)
         raw_id = document.get('id')
         row = await db.get(Application, int(raw_id)) if str(raw_id or '').isdigit() else None
         session = None
@@ -3369,43 +3526,31 @@ async def save_workflow(document: dict = Body(...), x_workspace_id: int = Header
             session = await db.get(DesignSession, str(raw_id))
             if session and session.workspace_id == x_workspace_id and session.user_id == user.id and session.application_id:
                 row = await db.get(Application, session.application_id)
-        if row and row.workspace_id != x_workspace_id:
-            raise HTTPException(403, '应用不属于当前工作空间')
-        old_kind = row.kind if row else kind
-        if not row:
-            row = Application(workspace_id=x_workspace_id, name=name, kind=kind)
-            db.add(row)
-            await db.flush()
-        # Saving edits the draft graph only. A published runtime snapshot is
-        # preserved until the explicit publish endpoint is called.
-        if row and row.published and not getattr(row, 'published_config', None):
-            row.published_config = await read_application(db, row)
-        row.name = name
-        row.kind = kind
-        row.updated_at = datetime.now(UTC).replace(tzinfo=None)
-        await write_application(db, row, definition)
-        app_root = relocate_app_root(x_workspace_id, row.id, old_kind, kind)
-        selected_skill_ids = {
-            str(skill_id) for agent in validated.agents for skill_id in agent.skills
-            if str(skill_id).isdigit()
-        }
-        skill_rows = (await db.scalars(select(Skill).where(
-            Skill.workspace_id == x_workspace_id,
-            Skill.id.in_([int(skill_id) for skill_id in selected_skill_ids]) if selected_skill_ids else text('false'),
-        ))).all()
-        materialize_application_resources(
-            app_root,{str(item.id):skill_document(item) for item in skill_rows},selected_skill_ids,
-            include_code=any(agent.allow_code_execution for agent in validated.agents),refresh=True,
-        )
-        if not str(raw_id or '').isdigit():
-            session = session or await db.get(DesignSession, str(raw_id or ''))
-            if session and session.workspace_id == x_workspace_id and session.user_id == user.id:
-                session.application_id = row.id
-                session.status = 'generated'
-        await sync_design_sessions_for_application(db, row.id, sync_definition, manual_changes)
+        if session and (session.workspace_id != x_workspace_id or session.user_id != user.id):
+            raise HTTPException(403, '编排会话不属于当前工作空间')
+        expected_revision = document.get('_base_revision')
+        if expected_revision is not None:
+            try:
+                expected_revision = int(expected_revision)
+            except (TypeError, ValueError) as exc:
+                raise HTTPException(422, '草稿版本号无效') from exc
+        try:
+            row, result = await persist_application_draft(
+                db,
+                x_workspace_id,
+                document,
+                application=row,
+                session=session,
+                manual_changes=manual_changes,
+                expected_revision=expected_revision,
+            )
+        except HTTPException:
+            raise
+        except Exception as exc:
+            raise HTTPException(422, f'应用编排无效：{exc}') from exc
         await db.commit()
         await db.refresh(row)
-        return workflow_document(row, await read_application(db, row))
+        return result
 
 
 @app.post('/api/workflows/{workflow_id}/publish')
@@ -4948,21 +5093,125 @@ async def skills(x_workspace_id: int = Header(alias='X-Workspace-Id'), user: Use
         rows = (await db.scalars(select(Skill).where(Skill.workspace_id == x_workspace_id))).all()
         return [skill_document(row) for row in rows]
 
+
+def normalize_skill_package(body: dict) -> dict:
+    """Normalize the editable package and reject paths that materialize differently."""
+    result = json.loads(json.dumps(body or {}, ensure_ascii=False))
+    result.pop('category', None)
+    name = str(result.get('name') or '').strip()
+    description = str(result.get('description') or '').strip()
+    instructions = str(result.get('instructions') or '').strip()
+    slug = str(result.get('slug') or '').strip()
+    if not name or not description or not instructions:
+        raise ValueError('Skill 名称、触发说明和指令不能为空')
+    manifest = (
+        f'---\nname: {slug}\n'
+        f'description: {json.dumps(description, ensure_ascii=False)}\n'
+        f'---\n\n{instructions}'
+    )
+    parse_skill_manifest(manifest)
+
+    def package_path(value, label: str) -> str:
+        raw = str(value or '').replace('\\', '/').strip('/')
+        try:
+            normalized = safe_relative_path(raw).as_posix()
+        except ValueError as exc:
+            raise ValueError(f'{label}路径不安全：{raw}') from exc
+        if normalized != raw or raw == 'SKILL.md':
+            raise ValueError(f'{label}路径无效：{raw}')
+        return raw
+
+    directories: set[str] = set()
+    for value in result.get('directories', []) or []:
+        path = package_path(value, '目录')
+        parts = path.split('/')
+        directories.update('/'.join(parts[:index]) for index in range(1, len(parts) + 1))
+
+    files = []
+    paths: set[str] = set()
+    for item in result.get('files', []) or []:
+        if not isinstance(item, dict):
+            raise ValueError('Skill 文件定义必须是对象')
+        path = package_path(item.get('path'), '文件')
+        if path in paths:
+            raise ValueError(f'Skill 中存在重复文件路径：{path}')
+        paths.add(path)
+        parent_parts = path.split('/')[:-1]
+        directories.update(
+            '/'.join(parent_parts[:index])
+            for index in range(1, len(parent_parts) + 1)
+        )
+        encoding = str(item.get('encoding') or 'utf8')
+        content = item.get('content', '')
+        if encoding not in {'utf8', 'base64'}:
+            raise ValueError(f'文件 {path} 的编码只能是 utf8 或 base64')
+        if not isinstance(content, str):
+            raise ValueError(f'文件 {path} 的内容必须是字符串')
+        if encoding == 'base64':
+            try:
+                base64.b64decode(content, validate=True)
+            except (ValueError, binascii.Error) as exc:
+                raise ValueError(f'文件 {path} 的 Base64 内容无效') from exc
+        kind = (
+            'script' if path == 'scripts' or path.startswith('scripts/')
+            else 'asset' if path == 'assets' or path.startswith('assets/')
+            else 'reference'
+        )
+        files.append({
+            **item,
+            'path': path,
+            'kind': kind,
+            'content': content,
+            'encoding': encoding,
+            'executable': bool(item.get('executable', kind == 'script')),
+        })
+    collision = paths & directories
+    if collision:
+        raise ValueError(f'路径同时被用作文件和目录：{sorted(collision)[0]}')
+    result.update({
+        'name': name,
+        'slug': slug,
+        'description': description,
+        'instructions': instructions,
+        'files': files,
+        'directories': sorted(directories),
+    })
+    return result
+
+
 @app.post('/api/skills')
 async def save_skill(body: dict = Body(...), x_workspace_id: int = Header(alias='X-Workspace-Id'), user: User = Depends(current_user)):
-    name = str(body.get('name', '')).strip(); description = str(body.get('description', '')).strip(); instructions = str(body.get('instructions', '')).strip()
-    slug = str(body.get('slug', '')).strip()
-    if not name or not description or not instructions: raise HTTPException(422, 'Skill 名称、触发说明和指令不能为空')
-    if not re.match(r'^[a-z0-9_-]+$', slug): raise HTTPException(422, 'Slug 只能使用小写英文、数字、下划线和连字符')
-    for item in body.get('files', []):
-        path = str(item.get('path', '')).replace('\\', '/').strip('/')
-        if not path or '..' in path.split('/'): raise HTTPException(422, f'文件路径不安全：{path}')
+    try:
+        document = normalize_skill_package(body)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
     async with SessionLocal() as db:
         await workspace_member(db, x_workspace_id, user.id, True)
         row = await db.get(Skill, int(body['id'])) if str(body.get('id', '')).isdigit() else None
         if row and row.workspace_id != x_workspace_id: raise HTTPException(403, 'Skill 不属于当前工作空间')
-        if not row: row = Skill(workspace_id=x_workspace_id, name=name, description=description, content={}); db.add(row)
-        row.name=name; row.description=description; row.content={key:value for key,value in body.items() if key!='id'}
+        if row:
+            expected = body.get('_base_revision', body.get('revision'))
+            try:
+                revision_matches = expected is None or int(expected) == int(row.revision or 1)
+            except (TypeError, ValueError) as exc:
+                raise HTTPException(422, 'Skill revision 必须是整数') from exc
+            if not revision_matches:
+                raise HTTPException(409, 'Skill 已在其他页面更新，请重新打开后继续编辑')
+            row.revision = int(row.revision or 1) + 1
+        else:
+            row = Skill(
+                workspace_id=x_workspace_id,
+                name=document['name'],
+                description=document['description'],
+                content={},
+                revision=1,
+            )
+            db.add(row)
+        row.name = document['name']
+        row.description = document['description']
+        row.updated_at = datetime.now(UTC).replace(tzinfo=None)
+        excluded = {'id', 'revision', 'updated_at', '_base_revision'}
+        row.content = {key: value for key, value in document.items() if key not in excluded}
         await db.commit(); await db.refresh(row); return skill_document(row)
 
 @app.delete('/api/skills/{skill_id}', status_code=204)
@@ -5006,7 +5255,22 @@ async def import_skills(files: list[UploadFile] = File(...), x_workspace_id: int
         try: content=data.decode('utf-8'); encoding='utf8'
         except UnicodeDecodeError: content=__import__('base64').b64encode(data).decode(); encoding='base64'
         extras.append({'path':relative,'kind':kind,'content':content,'encoding':encoding,'executable':kind=='script'})
-    document={'name':slug.replace('-',' ').title(),'slug':slug,'description':description,'instructions':instructions,'category':'Imported','version':'1.0.0','author':'local','source':'local','registry_ref':'','files':extras,'enabled':True,'status':'published'}
+    try:
+        document = normalize_skill_package({
+            'name': slug.replace('-', ' ').title(),
+            'slug': slug,
+            'description': description,
+            'instructions': instructions,
+            'version': '1.0.0',
+            'author': 'local',
+            'source': 'local',
+            'registry_ref': '',
+            'files': extras,
+            'enabled': True,
+            'status': 'published',
+        })
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
     async with SessionLocal() as db:
         row=Skill(workspace_id=x_workspace_id,name=document['name'],description=description,content=document);db.add(row);await db.commit();await db.refresh(row)
         return {'imported':[skill_document(row)]}
@@ -5022,7 +5286,7 @@ async def save_plugin(body:dict=Body(...),x_workspace_id:int=Header(alias='X-Wor
         await workspace_member(db,x_workspace_id,user.id,True);row=await db.get(Plugin,int(body['id'])) if str(body.get('id','')).isdigit() else None
         if row and row.workspace_id!=x_workspace_id: raise HTTPException(403,'工具不属于当前工作空间')
         if not row: row=Plugin(workspace_id=x_workspace_id);db.add(row)
-        configuration={k:v for k,v in body.items() if k not in {'id','name','kind','has_auth_token','has_headers'}}
+        configuration={k:v for k,v in body.items() if k not in {'id','name','kind','category','has_auth_token','has_headers'}}
         if row.id and not configuration.get('auth_token') and (row.configuration or {}).get('auth_token_encrypted'):
             configuration.pop('auth_token',None)
         if row.id and not configuration.get('headers') and (row.configuration or {}).get('headers_encrypted'):

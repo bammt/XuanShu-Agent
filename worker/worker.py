@@ -49,11 +49,20 @@ RUN_CONVERSATION_LOCK_TTL = int(os.getenv('RUN_CONVERSATION_LOCK_SECONDS', '7200
 async def recover_interrupted_studio_jobs() -> None:
     async with SessionLocal() as db:
         rows = (await db.scalars(select(DesignSession))).all()
-        queued = [
-            row.id for row in rows
-            if (row.active_job or {}).get('status') in {'queued', 'planning'}
-            and (row.active_job or {}).get('request')
-        ]
+        queued = []
+        for row in rows:
+            active = dict(row.active_job or {})
+            if active.get('status') not in {'queued', 'planning'} or not active.get('request'):
+                continue
+            # ``planning`` belongs to the worker process that just stopped.
+            # Startup recovery explicitly returns it to the only claimable
+            # state; the periodic requeue loop never touches live planning jobs.
+            active['status'] = 'queued'
+            active.pop('worker_id', None)
+            active['updated_at'] = datetime.now(UTC).replace(tzinfo=None).isoformat()
+            row.active_job = active
+            queued.append(row.id)
+        await db.commit()
     processing = await redis.lrange(STUDIO_PROCESSING_QUEUE, 0, -1)
     await redis.delete(STUDIO_PROCESSING_QUEUE)
     recovered = dict.fromkeys([*processing, *queued])
@@ -71,7 +80,7 @@ async def _process_studio_session(session_id: str) -> None:
             await redis.lrem(STUDIO_PROCESSING_QUEUE, 0, session_id)
             return
         active = dict(row.active_job or {})
-        if active.get('status') not in {'queued', 'planning'}:
+        if active.get('status') != 'queued':
             await redis.lrem(STUDIO_PROCESSING_QUEUE, 0, session_id)
             return
         request = active.get('request') or {}
@@ -85,9 +94,11 @@ async def _process_studio_session(session_id: str) -> None:
         row.history_tokens = history_tokens
         active['request'] = request
         active['status'] = 'planning'
+        active['worker_id'] = WORKER_ID
         active['updated_at'] = datetime.now(UTC).replace(tzinfo=None).isoformat()
         row.active_job = active
-        workspace_id, user_id = row.workspace_id, row.user_id
+        workspace_id = row.workspace_id
+        user_id = int(active.get('requested_by_user_id') or row.user_id)
         await db.commit()
     try:
         body = StudioChatIn.model_validate(request)

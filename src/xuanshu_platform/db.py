@@ -51,6 +51,7 @@ class Application(Base):
     # the editable draft; this JSON document changes only on explicit publish.
     published_config: Mapped[dict] = mapped_column(JSONB, default=dict)
     published: Mapped[bool] = mapped_column(Boolean, default=False)
+    draft_revision: Mapped[int] = mapped_column(Integer, default=1)
     public_token: Mapped[str | None] = mapped_column(String(80), unique=True, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
@@ -143,6 +144,8 @@ class Skill(Base):
     name: Mapped[str] = mapped_column(String(160))
     description: Mapped[str] = mapped_column(Text, default="")
     content: Mapped[dict] = mapped_column(JSONB, default=dict)
+    revision: Mapped[int] = mapped_column(Integer, default=1)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 class Plugin(Base):
     __tablename__ = "plugins"
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
@@ -252,6 +255,7 @@ async def init_db():
         await conn.execute(text("ALTER TABLE applications ADD COLUMN IF NOT EXISTS planning BOOLEAN NOT NULL DEFAULT FALSE"))
         await conn.execute(text("ALTER TABLE applications ADD COLUMN IF NOT EXISTS config JSONB NOT NULL DEFAULT '{}'::jsonb"))
         await conn.execute(text("ALTER TABLE applications ADD COLUMN IF NOT EXISTS published_config JSONB NOT NULL DEFAULT '{}'::jsonb"))
+        await conn.execute(text("ALTER TABLE applications ADD COLUMN IF NOT EXISTS draft_revision INTEGER NOT NULL DEFAULT 1"))
         # Before application deletion removed its DesignSession rows, old
         # versions detached generated sessions by setting application_id to
         # NULL.  A generated session without an application cannot be opened
@@ -282,10 +286,65 @@ async def init_db():
         await conn.execute(text('ALTER TABLE model_profiles ADD COLUMN IF NOT EXISTS max_retries INTEGER NOT NULL DEFAULT 5'))
         await conn.execute(text("ALTER TABLE model_profiles ADD COLUMN IF NOT EXISTS thinking_mode VARCHAR(20) NOT NULL DEFAULT 'auto'"))
         await conn.execute(text('ALTER TABLE model_profiles ADD COLUMN IF NOT EXISTS thinking_effort VARCHAR(20)'))
+        await conn.execute(text('ALTER TABLE skills ADD COLUMN IF NOT EXISTS revision INTEGER NOT NULL DEFAULT 1'))
+        await conn.execute(text('ALTER TABLE skills ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP'))
+        await conn.execute(text("UPDATE skills SET content = content - 'category' WHERE content ? 'category'"))
+        await conn.execute(text("UPDATE plugins SET configuration = configuration - 'category' WHERE configuration ? 'category'"))
         await conn.execute(text('ALTER TABLE design_sessions ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP'))
         await conn.execute(text("ALTER TABLE design_sessions ADD COLUMN IF NOT EXISTS active_job JSONB NOT NULL DEFAULT '{}'::jsonb"))
         await conn.execute(text("ALTER TABLE design_sessions ADD COLUMN IF NOT EXISTS history_summary TEXT NOT NULL DEFAULT ''"))
         await conn.execute(text("ALTER TABLE design_sessions ADD COLUMN IF NOT EXISTS history_tokens INTEGER NOT NULL DEFAULT 0"))
+        # One editable application owns exactly one Composer conversation.
+        # Preserve the latest session state and merge older transcripts before
+        # adding the database-level uniqueness guarantee on existing installs.
+        await conn.execute(text("""
+            WITH ranked AS (
+                SELECT id, application_id,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY application_id
+                           ORDER BY updated_at DESC, created_at DESC, id DESC
+                       ) AS rank
+                FROM design_sessions
+                WHERE application_id IS NOT NULL
+            ), merged AS (
+                SELECT ds.application_id,
+                       jsonb_agg(entry.message ORDER BY ds.created_at, entry.ordinality) AS messages
+                FROM design_sessions ds
+                CROSS JOIN LATERAL jsonb_array_elements(
+                    COALESCE(ds.messages, '[]'::jsonb)
+                ) WITH ORDINALITY AS entry(message, ordinality)
+                WHERE ds.application_id IS NOT NULL
+                GROUP BY ds.application_id
+            )
+            UPDATE design_sessions keeper
+            SET messages = merged.messages
+            FROM ranked, merged
+            WHERE keeper.id = ranked.id
+              AND ranked.rank = 1
+              AND merged.application_id = ranked.application_id
+              AND EXISTS (
+                  SELECT 1 FROM ranked duplicate
+                  WHERE duplicate.application_id = ranked.application_id
+                    AND duplicate.rank > 1
+              )
+        """))
+        await conn.execute(text("""
+            DELETE FROM design_sessions stale
+            USING (
+                SELECT id, ROW_NUMBER() OVER (
+                    PARTITION BY application_id
+                    ORDER BY updated_at DESC, created_at DESC, id DESC
+                ) AS rank
+                FROM design_sessions
+                WHERE application_id IS NOT NULL
+            ) ranked
+            WHERE stale.id = ranked.id AND ranked.rank > 1
+        """))
+        await conn.execute(text("""
+            CREATE UNIQUE INDEX IF NOT EXISTS uq_design_sessions_application_id
+            ON design_sessions (application_id)
+            WHERE application_id IS NOT NULL
+        """))
         await conn.execute(text("ALTER TABLE application_conversations ADD COLUMN IF NOT EXISTS state JSONB NOT NULL DEFAULT '{}'::jsonb"))
         await conn.execute(text("ALTER TABLE application_conversations ADD COLUMN IF NOT EXISTS history_summary TEXT NOT NULL DEFAULT ''"))
         await conn.execute(text("ALTER TABLE application_conversations ADD COLUMN IF NOT EXISTS history_tokens INTEGER NOT NULL DEFAULT 0"))

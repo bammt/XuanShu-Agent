@@ -15,7 +15,7 @@ async def requeue_studio_jobs() -> None:
         rows = (await db.scalars(select(DesignSession))).all()
         queued = [
             row.id for row in rows
-            if (row.active_job or {}).get('status') in {'queued', 'planning'}
+            if (row.active_job or {}).get('status') == 'queued'
             and (row.active_job or {}).get('request')
         ]
     pending = set(await redis.lrange(STUDIO_QUEUE, 0, -1))

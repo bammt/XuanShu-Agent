@@ -26,14 +26,16 @@ const pythonTemplate = `def run(query: str = "", **kwargs):
     """Return the tool result. Code runs inside the isolated executor."""
     return f"Processed: {query}"
 `
-const newPlugin = () => ({ name: '', description: '', kind: 'http', category: 'Tool', version: '0.1.0', module: '', class_name: 'CustomTool', package: '', source_code: pythonTemplate, source_path: '', input_schema: {}, env_vars: [], permissions: [], endpoint: '', method: 'POST', request_template: {}, response_path: '', server_url: '', command: '', args: [], headers: {}, auth_header: 'Authorization', auth_token: '', app_slug: '', cache_tools_list: true, enabled: true })
+const newPlugin = () => ({ name: '', description: '', kind: 'http', version: '0.1.0', module: '', class_name: 'CustomTool', package: '', source_code: pythonTemplate, source_path: '', input_schema: {}, env_vars: [], permissions: [], endpoint: '', method: 'POST', request_template: {}, response_path: '', server_url: '', command: '', args: [], headers: {}, auth_header: 'Authorization', auth_token: '', app_slug: '', cache_tools_list: true, enabled: true })
 const plugin = ref(newPlugin())
 const headersText = ref('{}')
 const schemaText = ref('{}')
 const argsText = ref('')
 const envText = ref('')
 const permissionText = ref('')
-const items = computed(() => (tab.value === 'skills' ? store.skills : store.plugins).filter(item => `${item.name} ${item.description} ${item.category}`.toLowerCase().includes(search.value.toLowerCase())))
+const items = computed(() => (tab.value === 'skills' ? store.skills : store.plugins).filter(item =>
+  `${item.name} ${item.description}`.toLowerCase().includes(search.value.toLowerCase()),
+))
 const kindLabels = { python: 'Python tool', http: 'HTTP API tool', mcp_http: 'MCP tool', mcp_sse: 'MCP tool', app: 'Connected app tool' }
 const transportLabels = { mcp_http: 'Streamable HTTP', mcp_sse: 'SSE' }
 const actionChoices = [
@@ -119,7 +121,7 @@ onMounted(async () => {
 
   <div v-if="modal" class="modal-backdrop" @click.self="modal=false"><section class="modal large"><header class="modal-header"><div><span class="eyebrow">AGENT TOOL</span><h2>{{ plugin.id ? '编辑' : '添加' }} Agent 可调用的工具</h2></div><button class="icon-button" @click="modal=false"><X :size="16" /></button></header><div class="modal-body">
     <div class="action-type-grid"><button v-for="choice in actionChoices" :key="choice.id" :class="{active:actionType===choice.id}" :disabled="choiceDisabled(choice)" @click="chooseAction(choice.id)"><component :is="choice.icon" :size="17" /><span><strong>{{ choice.label }}</strong><small>{{ choiceDisabled(choice)?'需先配置平台集成令牌':choice.detail }}</small></span></button></div>
-    <div class="form-grid action-form"><div class="field"><label>Name</label><input v-model="plugin.name" /></div><div class="field"><label>Category</label><input v-model="plugin.category" /></div><div class="field full"><label>Description</label><textarea v-model="plugin.description" placeholder="说明 Agent 何时调用、能完成什么以及限制。"></textarea></div>
+    <div class="form-grid action-form"><div class="field full"><label>Name</label><input v-model="plugin.name" /></div><div class="field full"><label>Description</label><textarea v-model="plugin.description" placeholder="说明 Agent 何时调用、能完成什么以及限制。"></textarea></div>
       <template v-if="actionType==='python'"><div class="field full"><label>执行方式</label><div class="segmented transport-switch"><button class="active">隔离源码</button></div></div><div class="field full"><label>Python source</label><textarea v-model="plugin.source_code" class="python-source"></textarea><small>必须定义 run(**kwargs) 或 main(**kwargs)。源码只在统一 executor 容器及当前应用工作目录中执行，不会加载进 Worker。</small></div><div class="field full"><label>Input schema (JSON Schema)</label><textarea v-model="schemaText"></textarea></div></template>
       <template v-if="actionType==='http'"><div class="field full"><label>Endpoint</label><input v-model="plugin.endpoint" placeholder="https://api.example.com/search/{query}" /></div><div class="field"><label>Method</label><select v-model="plugin.method"><option>GET</option><option>POST</option><option>PUT</option><option>PATCH</option><option>DELETE</option></select></div><div class="field"><label>Response path</label><input v-model="plugin.response_path" placeholder="data.items" /></div><div class="field full"><label>Request template (JSON)</label><textarea v-model="requestText"></textarea></div><div class="field full"><label>Input schema (JSON Schema)</label><textarea v-model="schemaText"></textarea></div></template>
       <template v-if="actionType==='mcp'"><div class="field full"><label>Connection</label><div class="segmented transport-switch"><button v-for="(label,key) in transportLabels" :key="key" :class="{active:mcpTransport===key}" @click="changeTransport(key)">{{ label }}</button></div></div><div class="field full"><label>Server URL</label><input v-model="plugin.server_url" placeholder="https://mcp.example.com/mcp" /></div><div class="field"><label>Auth header</label><input v-model="plugin.auth_header" /></div><div class="field"><label>Token</label><input v-model="plugin.auth_token" type="password" /></div><div class="field full"><label>Additional headers (JSON)</label><textarea v-model="headersText"></textarea></div><div class="field full"><small>为保持统一沙箱边界，仅支持远程 Streamable HTTP / SSE；本地 stdio 命令不会在 Worker 中执行。</small></div></template>

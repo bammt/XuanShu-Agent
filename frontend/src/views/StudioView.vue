@@ -312,6 +312,7 @@ const emptyWorkflow = (kind = creationKind()) => ({
   updated_at: new Date().toISOString(),
 });
 const workflow = ref(emptyWorkflow());
+const studioSessionId = ref("");
 
 const selectedTask = computed(() =>
   workflow.value.tasks.find((item) => item.id === selectedTaskId.value),
@@ -712,6 +713,7 @@ function migrate(item) {
   item.chat_history ??= [];
   item.inputs ??= [];
   item.structure_confirmed ??= true;
+  item.draft_revision ??= null;
   item.agents = item.agents.map((agent, index) => ({
     max_rpm: null,
     max_execution_time: null,
@@ -867,11 +869,12 @@ async function loadWorkflow() {
     try {
       const session = await api.studioSession(route.query.session);
       const persisted = session.application_id
-        ? store.workflows.find(
-            (item) => String(item.id) === String(session.application_id),
-          )
+        ? await api.workflow(session.application_id)
         : null;
       await restoreStudioSession(session, persisted);
+      if (session.application_id) {
+        await router.replace(`/studio/${session.application_id}`);
+      }
       return;
     } catch (error) {
       // Older builds incorrectly used the numeric application ID as the
@@ -898,25 +901,34 @@ async function loadWorkflow() {
     } catch (_) {
       found = JSON.parse(JSON.stringify(found));
     }
-    // An application route is authoritative for the editable draft.  A
-    // DesignSession is only the source for an explicit `?session=` route;
-    // restoring a related historical session here can overwrite persisted
-    // Agent settings such as user_interaction/ask_user on every page load.
-    hydrateWorkflow(JSON.parse(JSON.stringify(found)));
+    const session = found.studio_session;
+    if (session) await restoreStudioSession(session, found);
+    else {
+      studioSessionId.value = "";
+      hydrateWorkflow(JSON.parse(JSON.stringify(found)));
+    }
     return;
   }
   if (route.params.id && /^\d+$/.test(String(route.params.id))) {
     try {
-      hydrateWorkflow(await api.workflow(route.params.id));
+      const found = await api.workflow(route.params.id);
+      if (found.studio_session)
+        await restoreStudioSession(found.studio_session, found);
+      else {
+        studioSessionId.value = "";
+        hydrateWorkflow(found);
+      }
       return;
     } catch (error) {
       store.error = error.message;
     }
   }
   hydrateWorkflow(emptyWorkflow());
+  studioSessionId.value = "";
 }
 
 async function restoreStudioSession(session, persistedWorkflow = null) {
+  studioSessionId.value = String(session.id || "");
   const loaded = persistedWorkflow
     ? JSON.parse(JSON.stringify(persistedWorkflow))
     : emptyWorkflow();
@@ -950,7 +962,7 @@ async function restoreStudioSession(session, persistedWorkflow = null) {
     applyStudioResult(active.result, null);
   if (session.application_id && /^\d+$/.test(String(session.application_id))) {
     hydrating = true;
-    workflow.value.id = Number(session.application_id);
+    workflow.value.id = String(session.application_id);
     await nextTick();
     hydrating = false;
   }
@@ -1418,6 +1430,7 @@ async function autoSave() {
     hydrating = true;
     workflow.value.id = result.id;
     workflow.value.updated_at = result.updated_at;
+    workflow.value.draft_revision = result.draft_revision;
     workflow.value.draft_sync = result.draft_sync || workflow.value.draft_sync;
     markWorkflowPersisted(workflow.value);
     await nextTick();
@@ -1462,7 +1475,7 @@ async function executeStudioRequest(
     message: text,
     kind: requestKind,
     history,
-    orchestration_id: workflow.value.id,
+    orchestration_id: String(workflow.value.id),
     model_profile_id: workflow.value.model_profile_id,
     model: store.defaultModel?.model || workflow.value.model,
     attachment_ids: attachmentIds,
@@ -1566,7 +1579,12 @@ function applyGeneratedWorkflow(value) {
   selectedAgentId.value = "";
   selectedEdgeId.value = "";
   fitCanvas(220);
-  scheduleDraft();
+  draftDirty = false;
+  saveState.value = "Draft saved";
+  if (/^\d+$/.test(String(workflow.value.id || "")) &&
+      String(route.params.id || "") !== String(workflow.value.id)) {
+    router.replace(`/studio/${workflow.value.id}`);
+  }
 }
 
 async function consumeStudioJob(jobId, answer) {
@@ -1591,7 +1609,7 @@ async function consumeStudioJob(jobId, answer) {
 
 async function resumeStudioJob(
   jobId,
-  sessionId = route.query.session || workflow.value.id,
+  sessionId = studioSessionId.value || route.query.session || workflow.value.id,
 ) {
   let answer = [...messages.value]
     .reverse()
@@ -1637,9 +1655,13 @@ async function sendMessage() {
   }
   if (!text || uploading.value) return;
   // Flush a just-edited canvas before building the next Composer request. The
-  // request still carries the compact audit trail, so a failed save does not
-  // hide the user's current local graph from the Agent.
-  if (draftDirty && workflow.value.structure_confirmed) await autoSave();
+  // generation request must start from the same persisted revision that the
+  // Agent receives. A stale tab is stopped here instead of silently replacing
+  // a newer draft through natural-language generation.
+  if (draftDirty && workflow.value.structure_confirmed) {
+    await autoSave();
+    if (draftDirty) return;
+  }
   const history = messages.value
     .filter((item) => ["user", "assistant"].includes(item.role))
     .slice(-12)
@@ -1693,7 +1715,6 @@ async function sendMessage() {
   } finally {
     busy.value = false;
     activity.value = null;
-    scheduleDraft();
   }
 }
 

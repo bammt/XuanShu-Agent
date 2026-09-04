@@ -1,4 +1,5 @@
 import json
+import logging
 from collections.abc import Callable
 from contextvars import ContextVar
 from typing import Literal
@@ -1367,17 +1368,23 @@ def run_composer(request: str, stage: str, kind: str, existing: dict, model: dic
         })
         result = flow.state.result
         if memory and result.get('intent') == 'design' and stage in {'architecture', 'generation'}:
-            memory.remember(
-                _memory_summary(result),
-                scope='/preferences',
-                categories=['composer-preference'],
-                metadata={'workspace_id': workspace_id, 'stage': stage},
-                importance=.75,
-                source=str(user_id),
-                private=True,
-            )
+            try:
+                memory.remember(
+                    _memory_summary(result),
+                    scope='/preferences',
+                    categories=['composer-preference'],
+                    metadata={'workspace_id': workspace_id, 'stage': stage},
+                    importance=.75,
+                    source=str(user_id),
+                    private=True,
+                )
+            except Exception:
+                logging.exception('failed to persist non-critical Composer memory')
         return result
     finally:
         _composer_progress_callback.reset(progress_token)
         if memory:
-            memory.close()
+            try:
+                memory.close()
+            except Exception:
+                logging.exception('failed to close Composer memory')

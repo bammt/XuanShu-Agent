@@ -175,7 +175,11 @@ export const api = {
   }),
   saveWorkflow: (body, manualChanges = []) => request('/api/workflows', {
     method: 'POST',
-    body: JSON.stringify({ ...body, _manual_changes: manualChanges }),
+    body: JSON.stringify({
+      ...body,
+      _base_revision: body.draft_revision,
+      _manual_changes: manualChanges,
+    }),
   }),
   workflow: (id) => request(`/api/workflows/${id}`),
   publishWorkflow: (id) => request(`/api/workflows/${id}/publish`, { method: 'POST' }),
