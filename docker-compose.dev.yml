@@ -1,23 +1,27 @@
-# Development overlay. It keeps the dependency images and named data volumes
+# Development overlay. It keeps the dependency images and persistent data
 # from docker-compose.yml, while source changes are used after a restart.
 services:
   schema-init:
     volumes:
       - ./src:/app/src:ro
+      - ./alembic:/app/alembic:ro
 
   backend:
     volumes:
       - ./src:/app/src:ro
+      - ./alembic:/app/alembic:ro
 
   worker:
     volumes:
       - ./src:/app/src:ro
+      - ./alembic:/app/alembic:ro
       - ./worker/worker.py:/app/worker.py:ro
       - ./worker/studio_worker.py:/app/studio_worker.py:ro
 
   studio-worker:
     volumes:
       - ./src:/app/src:ro
+      - ./alembic:/app/alembic:ro
       - ./worker/worker.py:/app/worker.py:ro
       - ./worker/studio_worker.py:/app/studio_worker.py:ro
 

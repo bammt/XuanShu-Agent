@@ -90,9 +90,9 @@ services:
     tmpfs: [/tmp:size=128m]
     cap_drop: [ALL]
     security_opt: [no-new-privileges:true]
-    mem_limit: 1g
-    cpus: 1.0
-    pids_limit: 128
+    mem_limit: ${EXECUTOR_MEMORY_LIMIT:-1g}
+    cpus: ${EXECUTOR_CPU_LIMIT:-1.0}
+    pids_limit: ${EXECUTOR_PIDS_LIMIT:-128}
     healthcheck: { test: [CMD, python, -c, "import json,urllib.request; assert json.load(urllib.request.urlopen('http://127.0.0.1:8020/health'))['status']=='ok'"], interval: 5s, timeout: 3s, retries: 12 }
     restart: unless-stopped
   frontend:

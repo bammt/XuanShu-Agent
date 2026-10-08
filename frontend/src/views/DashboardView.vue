@@ -7,7 +7,6 @@ import {
   CircleCheck,
   Cpu,
   GitBranch,
-  Plus,
   Workflow,
 } from "lucide-vue-next";
 import { usePlatformStore } from "../stores/platform";
@@ -60,11 +59,8 @@ const metrics = computed(() => [
   <div class="page-heading">
     <div>
       <h2>工作空间概览</h2>
-      <p>构建、运行并观察 CrewAI Crew 与 Flow 智能体。</p>
+      <p>在一个工作台里构建、运行并观察你的智能体。</p>
     </div>
-    <button class="button primary" @click="router.push('/new-automation')">
-      <Plus :size="15" />创建智能体
-    </button>
   </div>
   <section class="metrics-grid">
     <article v-for="metric in metrics" :key="metric.label" class="metric-card">
@@ -103,7 +99,7 @@ const metrics = computed(() => [
       <p>{{ item.description || "暂无描述" }}</p>
       <div class="workflow-card-footer">
         <span
-          >{{ item.tasks.length }} steps · {{ item.agents.length }} agents</span
+          >{{ item.tasks.length }} 个节点 · {{ item.agents.length }} 个智能体</span
         ><span>{{ formatBeijingDate(item.updated_at) }}</span>
       </div>
     </article>
@@ -112,15 +108,12 @@ const metrics = computed(() => [
     v-else
     title="还没有智能体"
     detail="选择 Flow 或 Crew，并通过自然语言生成第一个智能体。"
-    ><button class="button accent" @click="router.push('/new-automation')">
-      创建智能体
-    </button></EmptyState
-  >
+  />
 
   <div class="section-heading">
     <h2>最近运行</h2>
     <button class="button ghost small" @click="router.push('/runs')">
-      打开 Traces
+      查看全部
     </button>
   </div>
   <section class="panel dashboard-runs-panel">

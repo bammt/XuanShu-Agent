@@ -10,6 +10,7 @@ import { api } from '../services/api'
 import { confirmDialog } from '../services/dialog'
 import { timestampValue } from '../services/dateFormatting'
 import { usePlatformStore } from '../stores/platform'
+import CodeEditor from '../components/CodeEditor.vue'
 
 const route = useRoute()
 const router = useRouter()
@@ -38,7 +39,6 @@ const expandedFolders = ref(new Set(DEFAULT_FOLDERS))
 const modifiedKeys = ref(new Set())
 const creating = ref(null)
 const createInput = ref(null)
-const editor = ref(null)
 const metadataOpen = ref(true)
 const cursor = ref({ line: 1, column: 1 })
 const saved = ref('Ready')
@@ -64,6 +64,10 @@ const activeIsBinary = computed(() => activeFile.value?.encoding === 'base64')
 const activeLanguage = computed(() => {
   const extension = activeFile.value?.path?.split('.').at(-1)?.toLowerCase()
   return ({ py: 'Python', md: 'Markdown', json: 'JSON', yaml: 'YAML', yml: 'YAML', js: 'JavaScript', ts: 'TypeScript', css: 'CSS', html: 'HTML', csv: 'CSV' })[extension] || 'Plain Text'
+})
+const activeEditorLanguage = computed(() => {
+  const extension = activeFile.value?.path?.split('.').at(-1)?.toLowerCase()
+  return ({ py: 'python', md: 'markdown', json: 'json' })[extension] || 'text'
 })
 
 const directoryPaths = computed(() => {
@@ -307,18 +311,7 @@ async function removeSelectedFolder() {
   if (!openKeys.value.includes(selectedKey.value)) openFile(openKeys.value.at(-1) || fileKey('SKILL.md'))
 }
 
-function updateCursor() {
-  if (!editor.value) return
-  const lines = editor.value.value.slice(0, editor.value.selectionStart).split('\n')
-  cursor.value = { line: lines.length, column: (lines.at(-1)?.length || 0) + 1 }
-}
-function editorKeydown(event) {
-  if (event.key !== 'Tab' || activeIsBinary.value) return
-  event.preventDefault()
-  const target = event.target; const position = target.selectionStart + 2
-  updateActive(`${target.value.slice(0, target.selectionStart)}  ${target.value.slice(target.selectionEnd)}`)
-  nextTick(() => { target.selectionStart = position; target.selectionEnd = position; updateCursor() })
-}
+function updateCursor(value) { if (value) cursor.value = value }
 function globalKeydown(event) {
   if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 's') { event.preventDefault(); save() }
 }
@@ -423,7 +416,7 @@ async function save() {
         <div class="editor-head"><input v-if="activeFile?.kind!=='skill'" class="editor-path" :value="activeFile?.path" aria-label="File path" @change="renameActive" /><span v-else>SKILL.md</span><div>
           <span v-if="activeIsBinary" class="tag">Binary · read-only</span><button v-if="activeFile?.kind!=='skill'" class="icon-button dark" title="删除文件" @click="removeActive"><Trash2 :size="13" /></button>
         </div></div>
-        <textarea ref="editor" :value="activeIsBinary?'':activeFile?.content" :readonly="activeIsBinary" :placeholder="activeIsBinary?'Binary file is not editable in the text editor.':''" spellcheck="false" @input="updateActive($event.target.value)" @keydown="editorKeydown" @click="updateCursor" @keyup="updateCursor"></textarea>
+        <CodeEditor :key="activeFile?.key" :model-value="activeIsBinary?'':activeFile?.content" :language="activeEditorLanguage" :readonly="activeIsBinary" :placeholder="activeIsBinary?'Binary file is not editable in the text editor.':''" min-height="100%" @update:model-value="updateActive" @cursor="updateCursor" />
         <footer class="dev-statusbar"><span v-if="activeFile?.kind==='script'">{{ activeFile.executable?'Executable':'Script' }}</span><span>Ln {{ cursor.line }}, Col {{ cursor.column }}</span><span>{{ activeFile?.encoding==='base64'?'Base64':'UTF-8' }}</span><span>{{ activeLanguage }}</span></footer>
       </section>
       <aside v-if="metadataOpen" class="dev-preview"><div class="dev-preview-head"><strong>SKILL METADATA</strong><span class="status-badge published">LOCAL</span></div><div class="form-grid">

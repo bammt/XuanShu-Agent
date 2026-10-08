@@ -37,6 +37,3 @@ packages = ["src/xuanshu_platform"]
 [tool.crewai]
 type = "flow"
 project_id = "caf3e20b-1fad-460a-a9c5-ca26e67650cc"
-
-[dependency-groups]
-dev = ["pytest>=8.3.4"]

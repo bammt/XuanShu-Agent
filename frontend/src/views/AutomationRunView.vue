@@ -23,6 +23,7 @@ import {
   Image,
   LoaderCircle,
   Paperclip,
+  RotateCcw,
   Plus,
   Send,
   SlidersHorizontal,
@@ -33,13 +34,14 @@ import {
   XCircle,
 } from "lucide-vue-next";
 import { api } from "../services/api";
-import { applyRunFrame } from "../services/runStream";
+import { applyRunFrame, createRunFrameBatcher } from "../services/runStream";
 import { stripLocalArtifactReferences } from "../services/messageFormatting";
 import { usePlatformStore } from "../stores/platform";
 import { confirmDialog } from "../services/dialog";
 import RunApprovalCard from "../components/RunApprovalCard.vue";
 import RichMessage from "../components/RichMessage.vue";
 import { formatBeijingDateTime } from "../services/dateFormatting";
+import { isLatestRunMessage } from "../services/latestRun";
 
 const route = useRoute();
 const router = useRouter();
@@ -62,6 +64,8 @@ const conversations = ref([]);
 let pollTimer = null;
 let runAbortController = null;
 let conversationLoading = false;
+let chatFollowBottom = true;
+let chatScrollTimer = null;
 
 // Runtime pages never use the editable store graph. Load the last published
 // snapshot directly so draft edits cannot change a live conversation.
@@ -156,8 +160,9 @@ function restoreConversation(conversation) {
         error: item.error || "执行失败",
         runId: item.id,
         status: item.status,
+        retryPayload: { inputs: item.inputs || {}, attachments: item.attachments || {}, message: item.user_message || '' },
       });
-    else if (item.status === "waiting_for_feedback") {
+    else if (item.status === "waiting_approval") {
       const answer = reactive({
         role: "assistant",
         text: "",
@@ -165,6 +170,8 @@ function restoreConversation(conversation) {
         status: item.status,
         streaming: false,
         steps: [],
+        turns: [],
+        finalTurnId: "",
       });
       messages.value.push(answer);
       openReview(item.id, item.pending_feedback, answer);
@@ -191,6 +198,8 @@ function restoreConversation(conversation) {
         status: item.status,
         streaming: true,
         steps: [],
+        turns: [],
+        finalTurnId: "",
       });
       messages.value.push(answer);
       activeRun = { id: item.id, answer };
@@ -225,7 +234,6 @@ async function loadConversation() {
         : await api.createConversation(workflow.value.id);
     }
     restoreConversation(conversation);
-    await refreshConversations();
     if (String(route.query.conversation || "") !== String(conversation.id))
       await router.replace({
         path: route.path,
@@ -274,11 +282,22 @@ function attachmentNames(record) {
   }
   return names;
 }
-function scrollChat() {
-  nextTick(() => {
-    if (chatThread.value)
-      chatThread.value.scrollTop = chatThread.value.scrollHeight;
-  });
+function onChatScroll() {
+  const element = chatThread.value;
+  if (!element) return;
+  chatFollowBottom = element.scrollHeight - element.scrollTop - element.clientHeight < 96;
+}
+function scrollChat(force = false) {
+  if (force) chatFollowBottom = true;
+  if (!chatFollowBottom) return;
+  if (chatScrollTimer) window.clearTimeout(chatScrollTimer);
+  chatScrollTimer = window.setTimeout(() => {
+    chatScrollTimer = null;
+    nextTick(() => {
+      if (chatThread.value && chatFollowBottom)
+        chatThread.value.scrollTop = chatThread.value.scrollHeight;
+    });
+  }, 32);
 }
 function keepUploadStatusVisible(startedAt, minimumMs = 450) {
   return new Promise((resolve) =>
@@ -353,9 +372,7 @@ async function chooseFiles(input, event) {
     const uploaded = await api.uploadStudioAttachments(selected, (value) => {
       uploadProgress.value = value;
     });
-    files[input.name] = input.multiple
-      ? [...files[input.name], ...uploaded]
-      : uploaded.slice(0, 1);
+    files[input.name] = [...(files[input.name] || []), ...uploaded];
   } catch (error) {
     store.error = error.message;
   } finally {
@@ -385,16 +402,9 @@ async function chooseComposerFiles(event) {
           input.input_type !== "image" ||
           file.content_type?.startsWith("image/"),
       );
-      const target =
-        matching.find(
-          (input) => input.multiple || !files[input.name]?.length,
-        ) ||
-        matching[0] ||
-        fileInputs.value[0];
+      const target = composerFileField.value || matching[0] || fileInputs.value[0];
       files[target.name] ||= [];
-      files[target.name] = target.multiple
-        ? [...files[target.name], file]
-        : [file];
+      files[target.name] = [...files[target.name], file];
     }
   } catch (error) {
     store.error = error.message;
@@ -456,7 +466,6 @@ async function poll(id, answer) {
       busy.value = false;
       answer.routerOnly =
         record.metrics?.runtime_type === "conversation_router";
-      await store.load();
       scrollChat();
       return;
     }
@@ -466,13 +475,11 @@ async function poll(id, answer) {
       answer.error = record.error || "执行失败";
       answer.streaming = false;
       busy.value = false;
-      await store.load();
       scrollChat();
       return;
     }
-    if (record.status === "waiting_for_feedback") {
+    if (record.status === "waiting_approval") {
       openReview(record.id, record.pending_feedback, answer);
-      await store.load();
       return;
     }
     if (record.status === "waiting_input") {
@@ -487,7 +494,6 @@ async function poll(id, answer) {
       answer.streaming = false;
       answer.status = "waiting_input";
       busy.value = false;
-      await store.load();
       scrollChat();
       return;
     }
@@ -526,7 +532,7 @@ function openReview(runId, pending, answer) {
       busy: false,
     });
   answer.text = "";
-  answer.status = "waiting_for_feedback";
+  answer.status = "waiting_approval";
   answer.streaming = false;
   busy.value = false;
   scrollChat();
@@ -555,11 +561,9 @@ async function streamRun(id, answer) {
   runAbortController = controller;
   let terminal = "";
   try {
-    await api.runEvents(
-      id,
-      (frame) => {
+    const batcher = createRunFrameBatcher((frame) => {
         terminal = applyRunFrame(answer, frame) || terminal;
-        if (frame.type === "waiting_for_feedback")
+        if (frame.type === "approval.required")
           openReview(id, frame.pending_feedback || {}, answer);
         if (
           frame.type === "run.waiting_input" &&
@@ -567,15 +571,18 @@ async function streamRun(id, answer) {
             frame.waiting_input?.accepts_files ||
             frame.waiting_input?.file_input_names?.length)
         )
-          variablesOpen.value = true;
+            variablesOpen.value = true;
         scrollChat();
-      },
+      });
+    await api.runEvents(
+      id,
+      (frame) => batcher.push(frame),
       controller.signal,
       answer.eventCursor || 0,
     );
+    await batcher.finish();
     if (!terminal) return poll(id, answer);
     busy.value = false;
-    await store.load();
     await refreshConversations();
     scrollChat();
   } catch (error) {
@@ -583,6 +590,13 @@ async function streamRun(id, answer) {
   } finally {
     if (runAbortController === controller) runAbortController = null;
   }
+}
+async function retryRun(answer) {
+  if (!isLatestRunMessage(messages.value, answer) || busy.value || answer.retrying) return;
+  answer.retrying = true; answer.role = 'assistant'; answer.error = ''; answer.text = ''; answer.files = []; answer.turns = []; answer.finalTurnId = ''; answer.activity = ''; answer.status = 'queued'; answer.streaming = true; busy.value = true;
+  try { const retry = await api.retryRun(answer.runId); if (Number.isFinite(retry?.event_cursor)) answer.eventCursor = retry.event_cursor; await streamRun(answer.runId, answer) }
+  catch (error) { answer.role = 'error'; answer.error = error.message; answer.text = `没有完成：${error.message}`; answer.streaming = false; store.error = error.message }
+  finally { answer.retrying = false; busy.value = false }
 }
 async function sendMessage() {
   if (!canSend.value) return;
@@ -603,18 +617,12 @@ async function sendMessage() {
       name: item.name,
     }));
     messages.value.push({ role: "user", text, attachments: shownFiles });
-    const answer = reactive({
-      role: "assistant",
-      text: "",
-      streaming: true,
-      status: "queued",
-      runId: "",
-      steps: [],
-    });
+    const answer = reactive({ role: "assistant", text: "", streaming: true, status: "queued", runId: "", steps: [], turns: [], finalTurnId: "",
+      retryPayload: { inputs: JSON.parse(JSON.stringify(inputs)), attachments: JSON.parse(JSON.stringify(attachments)), message: submittedMessage } });
     messages.value.push(answer);
     busy.value = true;
     currentMessage.value = "";
-    scrollChat();
+    scrollChat(true);
     const record = await api.runWorkflow(
       workflow.value.id,
       inputs,
@@ -664,7 +672,7 @@ async function sendMessage() {
         >
           <ArrowLeft :size="18" />
         </button>
-        <span class="chat-app-icon"><Bot :size="19" /></span>
+        <span class="chat-app-icon"><img src="/xuanshu-mark.svg?v=8" alt="玄枢" /></span>
         <div class="chat-app-title">
           <strong>{{ workflow.name }}</strong
           ><small>{{ workflow.kind.toUpperCase() }} · 已发布</small>
@@ -717,6 +725,7 @@ async function sendMessage() {
             :class="{ active: item.id === conversationId }"
             @click="chooseConversation(item.id)"
           >
+            <img class="chat-history-mark" src="/xuanshu-mark.svg?v=8" alt="" />
             <div>
               <strong>{{ item.title || "新对话" }}</strong>
               <small>{{ formatBeijingDateTime(item.updated_at) }}</small>
@@ -732,7 +741,7 @@ async function sendMessage() {
         <p v-else class="chat-history-empty">暂无历史对话</p>
       </aside>
       <section class="chat-surface">
-        <div ref="chatThread" class="chat-thread">
+        <div ref="chatThread" class="chat-thread" @scroll="onChatScroll">
           <div class="chat-thread-inner">
             <article
               v-for="(message, index) in messages"
@@ -755,62 +764,29 @@ async function sendMessage() {
                     ><FileText :size="12" />{{ file.name }}</span
                   >
                 </div>
-                <div v-if="message.steps?.length" class="run-activity">
-                  <header>
-                    <GitBranch :size="13" /><strong>执行进度</strong
-                    ><span
-                      >{{
-                        message.steps.filter(
-                          (item) => item.status === "completed",
-                        ).length
-                      }}/{{ message.steps.length }}</span
-                    >
-                  </header>
-                  <ol>
-                    <li
-                      v-for="step in message.steps"
-                      :key="step.step_id"
-                      :class="[step.status, { expanded: step.expanded }]"
-                    >
-                      <i></i>
-                      <div>
-                        <div class="run-step-heading">
-                          <strong>{{ step.agent_role }}</strong
-                          ><button
-                            v-if="step.output"
-                            class="run-step-toggle"
-                            type="button"
-                            :title="
-                              step.expanded
-                                ? '收起智能体输出'
-                                : '展开智能体输出'
-                            "
-                            :aria-label="
-                              step.expanded
-                                ? '收起智能体输出'
-                                : '展开智能体输出'
-                            "
-                            :aria-expanded="step.expanded"
-                            @click="step.expanded = !step.expanded"
-                          >
-                            <ChevronDown :size="13" />
-                          </button>
-                        </div>
-                        <small
-                          >{{ step.step_name
-                          }}<template v-if="step.tool_name">
-                            · {{ step.tool_name }}</template
-                          ></small
-                        >
-                        <p
-                          v-if="step.preview"
-                          :class="{ expanded: step.expanded }"
-                        >
-                          {{ step.expanded ? step.output : step.preview }}
-                        </p>
+                <div v-if="message.turns?.length" class="agent-turn-list">
+                  <article
+                    v-for="turn in message.turns"
+                    :key="turn.id"
+                    class="agent-turn"
+                    :class="[turn.status, { collapsed: !turn.expanded }]"
+                  >
+                    <button class="agent-turn-head" type="button" @click="turn.expanded = !turn.expanded">
+                      <span class="agent-turn-dot" :class="turn.status"></span>
+                      <span class="agent-turn-title"><strong>{{ turn.agent_role }}</strong><small>{{ turn.step_name }}</small></span>
+                      <span class="agent-turn-state">{{ turn.status === 'running' ? '运行中' : turn.status === 'failed' ? '失败' : turn.status === 'waiting_input' ? '等待输入' : '已完成' }}</span>
+                      <ChevronDown :size="14" />
+                    </button>
+                    <div v-if="turn.expanded" class="agent-turn-body">
+                      <div v-if="turn.activity" class="agent-turn-activity"><span class="activity-pulse-dot"></span>{{ turn.activity }}</div>
+                      <div v-if="turn.tools?.length" class="agent-turn-tools">
+                        <div v-for="tool in turn.tools" :key="tool.id" class="agent-turn-tool" :class="tool.status"><LoaderCircle v-if="tool.status === 'running'" class="spin" :size="12" /><Check v-else-if="tool.status === 'completed'" :size="12" /><XCircle v-else :size="12" /><span><strong>{{ tool.name }}</strong><small>{{ tool.detail }}</small></span></div>
                       </div>
-                    </li>
-                  </ol>
+                      <RichMessage v-if="turn.output && turn.status !== 'running'" class="agent-turn-output agent-turn-rich-output" :text="turn.output" />
+                      <pre v-else-if="turn.output" class="agent-turn-output">{{ turn.output }}</pre>
+                      <span v-if="turn.status === 'running'" class="stream-caret"></span>
+                    </div>
+                  </article>
                 </div>
                 <RunApprovalCard
                   v-for="approval in message.approvals || []"
@@ -820,7 +796,11 @@ async function sendMessage() {
                   @submit="submitReview(message, approval, $event)"
                 />
                 <div v-if="message.runtimeNotice" class="run-runtime-notice">
-                  {{ message.runtimeNotice }}
+                  <span>{{ message.runtimeNotice }}</span>
+                  <small v-if="message.retryHistory?.length">已自动恢复 {{ message.retryHistory.length }} 次</small>
+                </div>
+                <div v-if="message.activity && !message.turns?.length" class="run-current-activity">
+                  <span class="activity-pulse-dot"></span>{{ message.activity }}
                 </div>
                 <div
                   v-if="message.streaming && !message.text"
@@ -846,7 +826,7 @@ async function sendMessage() {
                   class="stream-caret"
                 ></span>
                 <div
-                  v-if="message.runId && !message.streaming"
+                  v-if="message.runId && !message.streaming && ['completed', 'failed', 'waiting_input'].includes(message.status)"
                   class="chat-message-meta"
                 >
                   <span>{{
@@ -861,7 +841,7 @@ async function sendMessage() {
                     @click="router.push(`/runs/${conversationId}`)"
                   >
                     查看 Trace <ExternalLink :size="11" />
-                  </button>
+                  </button><button v-if="isLatestRunMessage(messages, message)" class="chat-round-retry" type="button" title="重试这一轮" aria-label="重试这一轮" :disabled="busy || message.retrying" @click="retryRun(message)"><LoaderCircle v-if="message.retrying" class="spin" :size="11" /><RotateCcw v-else :size="11" /></button>
                 </div>
               </div>
             </article>
@@ -1044,7 +1024,7 @@ async function sendMessage() {
                 hidden
                 type="file"
                 :disabled="uploading"
-                :multiple="input.multiple"
+                multiple
                 :accept="input.input_type === 'image' ? 'image/*' : '*/*'"
                 @change="chooseFiles(input, $event)"
             /></label>

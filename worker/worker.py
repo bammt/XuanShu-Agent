@@ -3,6 +3,8 @@ import copy
 import logging
 import os
 import socket
+import threading
+import time
 import uuid
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -12,8 +14,9 @@ from sqlalchemy import delete, or_, select, update
 from xuanshu_platform.config import settings
 from xuanshu_platform.crypto import decrypt_secret
 from xuanshu_platform.db import Application, ApplicationConversation, DesignSession, ExternalConversation, KnowledgeBase, KnowledgeFile, ModelProfile, Plugin, Run, SessionLocal, Skill
-from xuanshu_platform.api import (StudioChatIn, persist_studio_job_failure, run_studio_job,
-                                  studio_execution_resources, studio_model, studio_resources)
+from xuanshu_platform.studio_jobs import (persist_studio_job_failure, run_studio_job,
+                                          studio_execution_resources, studio_model, studio_resources)
+from xuanshu_platform.studio_proposals import StudioChatIn
 from xuanshu_platform.persistence import read_application, read_published_application
 from xuanshu_platform.retry import is_transient_error
 from xuanshu_platform.runtime import execute_application, unique_events
@@ -107,7 +110,7 @@ async def _process_studio_session(session_id: str) -> None:
         runtime_resources = await studio_execution_resources(workspace_id)
         await run_studio_job(job_id, body, workspace_id, user_id, model, resources, runtime_resources)
     except Exception as exc:
-        logging.exception('studio session %s failed before composer execution', session_id)
+        logging.exception('studio session %s job %s failed', session_id, job_id)
         detail = exc.detail if hasattr(exc, 'detail') else str(exc)
         await persist_studio_job_failure(job_id, session_id, workspace_id, user_id, detail)
     finally:
@@ -357,7 +360,8 @@ async def heartbeat(run_id: str) -> None:
 async def persist_runtime_event(run_id: str, event: dict) -> None:
     """Persist every state transition before the next node may start."""
     async with SessionLocal() as db:
-        run = await db.get(Run, run_id)
+        # Serialize the read/append/write across concurrent SDK callbacks.
+        run = await db.scalar(select(Run).where(Run.id == run_id).with_for_update())
         if not run or run.status != 'running' or run.worker_id != WORKER_ID:
             return
         events = list(run.events or [])
@@ -410,22 +414,75 @@ async def _process(run_id: str) -> None:
                                         'embedding': embedding_config(profile_map[item.embedding_model_id])}
                           for item in knowledge_bases if item.embedding_model_id in profile_map and item.status == 'ready'},
         }
-        state['execution_id'] = run_id
+        # A manual retry gets a fresh execution scope so tool idempotency does
+        # not suppress the work that the user explicitly asked to run again.
+        state['execution_id'] = str(state.get('execution_id') or run_id)
+        run_attempt = int(state.get('run_attempt') or 0)
         files = state.get('files', [])
         events = list(run.events or [])
-        events.append({
+        started_event = {
             'type': 'run.started', 'application': app.name,
             'at': datetime.now(UTC).isoformat(),
-        })
+        }
+        if run_attempt:
+            started_event['run_attempt'] = run_attempt
+        events.append(started_event)
         run.events = events
         await db.commit()
     await redis.hset(f'run:{run_id}', mapping={'status': 'running'})
     heartbeat_task = asyncio.create_task(heartbeat(run_id))
     try:
         loop = asyncio.get_running_loop()
-        def on_runtime_event(event: dict) -> None:
+        delta_buffers: dict[tuple[str, str, str], dict[str, object]] = {}
+        delta_lock = threading.Lock()
+        delta_threshold = 64
+
+        def submit_runtime_event(event: dict) -> None:
             future = asyncio.run_coroutine_threadsafe(persist_runtime_event(run_id, event), loop)
             future.result(timeout=20)
+
+        def flush_runtime_deltas() -> None:
+            with delta_lock:
+                pending = list(delta_buffers.values())
+                delta_buffers.clear()
+            for item in pending:
+                event = dict(item['event'])
+                event['text'] = str(item['text'])
+                event['delta_count'] = int(item['count'])
+                submit_runtime_event(event)
+
+        def on_runtime_event(event: dict) -> None:
+            if run_attempt:
+                event = {**event, 'run_attempt': run_attempt}
+            if event.get('type') == 'llm.delta' and event.get('text'):
+                key = (
+                    str(event.get('node_id') or ''),
+                    str(event.get('agent_id') or ''),
+                    str(event.get('llm_call_id') or ''),
+                )
+                with delta_lock:
+                    entry = delta_buffers.get(key)
+                    if entry is None:
+                        entry = {'event': dict(event), 'text': '', 'count': 0}
+                        delta_buffers[key] = entry
+                    entry['text'] = str(entry['text']) + str(event['text'])
+                    entry['count'] = int(entry['count']) + 1
+                    should_flush = len(str(entry['text'])) >= delta_threshold
+                    if should_flush:
+                        delta_buffers.pop(key, None)
+                        flush_item = entry
+                    else:
+                        flush_item = None
+                if flush_item is not None:
+                    merged = dict(flush_item['event'])
+                    merged['text'] = str(flush_item['text'])
+                    merged['delta_count'] = int(flush_item['count'])
+                    submit_runtime_event(merged)
+                return
+            # Lifecycle and tool events must be visible immediately. Flush
+            # pending text first so the event order remains readable.
+            flush_runtime_deltas()
+            submit_runtime_event(event)
         mapped = {}
         for item in profiles:
             # Application definitions persist profile references as strings,
@@ -443,14 +500,19 @@ async def _process(run_id: str) -> None:
                 'max_retries': item.max_retries,
                 'thinking_mode': item.thinking_mode,
                 'thinking_effort': item.thinking_effort,
+                'supports_vision': item.supports_vision,
             }
             mapped[item.id] = config
             mapped[str(item.id)] = config
         default = next((item for item in profiles if item.model_type == 'chat' and item.is_default), None)
         if default:
             mapped['default'] = mapped[default.id]
-        result = await asyncio.to_thread(execute_application, runtime_app, run.input_text, files, state,
-                                         mapped, definition, resources, on_runtime_event)
+        result = await asyncio.wait_for(
+            asyncio.to_thread(execute_application, runtime_app, run.input_text, files, state,
+                              mapped, definition, resources, on_runtime_event),
+            timeout=max(1, int(settings.run_timeout_seconds)),
+        )
+        flush_runtime_deltas()
         async with SessionLocal() as db:
             run = await db.get(Run, run_id)
             events = list(run.events or [])
@@ -472,7 +534,13 @@ async def _process(run_id: str) -> None:
                 *changed_artifacts,
                 *(name for name in state.get('artifacts', []) if name in current and name not in files),
             })
-            events = unique_events([*events, *result['events']])
+            result_events = list(result.get('events') or [])
+            if run_attempt:
+                result_events = [
+                    ({**event, 'run_attempt': run_attempt} if isinstance(event, dict) else event)
+                    for event in result_events
+                ]
+            events = unique_events([*events, *result_events])
             if changed_artifacts:
                 await ensure_bucket()
                 for name in changed_artifacts:
@@ -490,7 +558,13 @@ async def _process(run_id: str) -> None:
                 'type': f"run.{result['status']}", 'output': result['output'],
                 'at': datetime.now(UTC).isoformat(),
             }
-            if not any(item.get('type') == terminal_event['type'] for item in events):
+            if run_attempt:
+                terminal_event['run_attempt'] = run_attempt
+            if not any(
+                item.get('type') == terminal_event['type']
+                and int(item.get('run_attempt') or 0) == run_attempt
+                for item in events
+            ):
                 events.append(terminal_event)
             run.status = result['status']
             run.output = result['output']
@@ -540,21 +614,35 @@ async def _process(run_id: str) -> None:
         await redis.hset(f'run:{run_id}', mapping={'status': result['status'], 'output': result['output']})
     except Exception as exc:
         logging.exception('run %s failed', run_id)
+        timed_out = isinstance(exc, asyncio.TimeoutError)
+        if timed_out:
+            exc = TimeoutError(
+                f'运行超过平台超时限制（{max(1, int(settings.run_timeout_seconds))} 秒）'
+            )
         async with SessionLocal() as db:
             run = await db.get(Run, run_id)
-            if run and is_transient_error(exc) and run.retry_count < settings.run_max_retries:
+            streamed_output = any(
+                isinstance(event, dict) and event.get('type') == 'llm.delta'
+                for event in (run.events or [])
+            ) if run else False
+            if (run and not timed_out and not streamed_output
+                    and is_transient_error(exc) and run.retry_count < settings.run_max_retries):
                 attempt = run.retry_count + 1
                 events = list(run.events or [])
                 events.append({
                     'type': 'run.retrying',
                     'attempt': attempt,
+                    'run_attempt': attempt,
                     'message': f'模型连接暂时中断，正在进行第 {attempt} 次恢复',
                 })
+                state['run_attempt'] = attempt
+                state['execution_id'] = f'{run.id}:auto-retry:{attempt}:{uuid.uuid4().hex[:8]}'
                 run.status = 'queued'
                 run.retry_count = attempt
                 run.worker_id = None
                 run.heartbeat_at = None
                 run.events = events
+                run.approval_payload = state
                 await db.commit()
                 await redis.hset(f'run:{run_id}', mapping={'status': 'queued'})
                 delay = min(settings.run_retry_base_seconds * (2 ** (attempt - 1)), 30)

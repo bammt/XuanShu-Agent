@@ -7,7 +7,6 @@ import {
   GitBranch,
   Pencil,
   Play,
-  Plus,
   Search,
   Trash2,
 } from "lucide-vue-next";
@@ -30,7 +29,11 @@ const filtered = computed(() =>
       `${item.name} ${item.description}`
         .toLowerCase()
         .includes(search.value.toLowerCase()),
-  ),
+  ).sort((a, b) => {
+    const left = Date.parse(a.created_at || '') || 0;
+    const right = Date.parse(b.created_at || '') || 0;
+    return right - left || Number(b.id || 0) - Number(a.id || 0);
+  }),
 );
 async function remove(item) {
   if (!(await confirmDialog({
@@ -73,11 +76,8 @@ function runItem(item) {
   <div class="page-heading">
     <div>
       <h2>智能体</h2>
-      <p>管理 Crew 与 Flow 智能体的草稿、发布状态和独立运行入口。</p>
+      <p>管理智能体的草稿、发布状态和运行入口。</p>
     </div>
-    <button class="button primary" @click="router.push('/new-automation')">
-      <Plus :size="15" />新建智能体
-    </button>
   </div>
   <div class="toolbar">
     <div class="toolbar-left">
@@ -100,7 +100,7 @@ function runItem(item) {
         </button>
       </div>
     </div>
-    <span style="font-size: 10px; color: var(--subtle)"
+    <span style="font-size: 13px; color: var(--subtle)"
       >{{ filtered.length }} 个智能体</span
     >
   </div>
@@ -129,7 +129,7 @@ function runItem(item) {
         <span
           ><strong>{{ item.tasks.length }}</strong> 节点</span
         ><span
-          ><strong>{{ item.agents.length }}</strong> Agent</span
+          ><strong>{{ item.agents.length }}</strong> 智能体</span
         ><span
           ><strong>{{ item.inputs?.length || 0 }}</strong> 输入</span
         >
@@ -171,6 +171,6 @@ function runItem(item) {
   <EmptyState
     v-else
     title="没有匹配的智能体"
-    detail="调整筛选条件，或创建新的 CrewAI Crew/Flow 智能体。"
+    detail="调整筛选条件，或创建一个新的智能体。"
   />
 </template>

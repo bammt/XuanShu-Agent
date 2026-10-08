@@ -1,11 +1,13 @@
 <script setup>
 import { computed, nextTick, onMounted, reactive, ref } from 'vue'
 import { useRoute } from 'vue-router'
-import { Bot, Check, ChevronDown, Download, FileText, Image, LoaderCircle, Paperclip, Send, Trash2, X } from 'lucide-vue-next'
+import { Bot, Check, ChevronDown, Download, FileText, Image, LoaderCircle, Paperclip, RotateCcw, Send, Trash2, X } from 'lucide-vue-next'
 import { stripLocalArtifactReferences } from '../services/messageFormatting'
+import { applyRunFrame, createRunFrameBatcher } from '../services/runStream'
 import { confirmDialog } from '../services/dialog'
 import RichMessage from '../components/RichMessage.vue'
 import { formatBeijingDateTime } from '../services/dateFormatting'
+import { isLatestRunMessage } from '../services/latestRun'
 
 const token = useRoute().params.token
 const app = ref(null), loading = ref(true), error = ref(''), message = ref(''), busy = ref(false), uploading = ref(false), uploadProgress = ref(0), thread = ref(null)
@@ -16,7 +18,20 @@ const textInput = computed(() => app.value?.inputs.find(item => ['text', 'long_t
 const extraInputs = computed(() => app.value?.inputs.filter(item => item.name !== textInput.value?.name && !['file', 'image'].includes(item.input_type)) || [])
 const fileInputs = computed(() => app.value?.inputs.filter(item => ['file', 'image'].includes(item.input_type)) || [])
 const selectedFiles = computed(() => fileInputs.value.flatMap(input => (files[input.name] || []).map(file => ({ input, file }))))
-const scroll = () => nextTick(() => { if (thread.value) thread.value.scrollTop = thread.value.scrollHeight })
+let followBottom = true
+let scrollTimer = null
+function onThreadScroll() {
+  if (thread.value) followBottom = thread.value.scrollHeight - thread.value.scrollTop - thread.value.clientHeight < 96
+}
+const scroll = (force = false) => {
+  if (force) followBottom = true
+  if (!followBottom) return
+  if (scrollTimer) window.clearTimeout(scrollTimer)
+  scrollTimer = window.setTimeout(() => {
+    scrollTimer = null
+    nextTick(() => { if (thread.value && followBottom) thread.value.scrollTop = thread.value.scrollHeight })
+  }, 32)
+}
 
 onMounted(async () => {
   try {
@@ -58,14 +73,14 @@ async function openConversation(id, updateUrl = true) {
   messages.value = [{ role: 'assistant', text: app.value.welcome }]
   for (const item of data.runs || []) {
     if (item.user_message) messages.value.push({ role: 'user', text: item.user_message, attachments: Object.values(item.attachments || {}).flat() })
-    if (item.status === 'completed') messages.value.push({ role: 'assistant', text: stripLocalArtifactReferences(item.output), files: item.files || [], done: true })
-    else if (item.status === 'failed') messages.value.push({ role: 'assistant', text: stripLocalArtifactReferences(item.output), error: item.error || item.output, done: true })
-    else if (item.status === 'waiting_for_feedback') {
+    if (item.status === 'completed') messages.value.push({ role: 'assistant', text: stripLocalArtifactReferences(item.output), files: item.files || [], done: true, status: 'completed', runId: item.id })
+    else if (item.status === 'failed') messages.value.push({ role: 'assistant', text: stripLocalArtifactReferences(item.output), error: item.error || item.output, done: true, status: 'failed', runId: item.id })
+    else if (item.status === 'waiting_approval') {
       const answer = reactive({ role: 'assistant', text: '流程已暂停，等待你的审核。', done: true })
       messages.value.push(answer)
       approval.value = { runId: item.id, ...(item.pending_feedback || {}), eventCursor: item.events?.length || 0 }
     } else if (item.status === 'waiting_input') {
-      messages.value.push({ role: 'assistant', text: stripLocalArtifactReferences(item.output) || item.waiting_input?.question || '请补充必要信息。', done: true })
+      messages.value.push({ role: 'assistant', text: stripLocalArtifactReferences(item.output) || item.waiting_input?.question || '请补充必要信息。', done: true, status: 'waiting_input', runId: item.id })
     }
   }
   if (updateUrl) window.history.replaceState({}, '', `${window.location.pathname}?conversation=${encodeURIComponent(id)}`)
@@ -142,13 +157,6 @@ function parsedInputs() {
   return result
 }
 function eventData(block) { return block.split(/\r?\n/).filter(line => line.startsWith('data:')).map(line => line.slice(5).trim()).join('\n') }
-function mergeNodeResult(answer, frame) {
-  const id = frame.node_id || `${frame.node_name || 'node'}:${frame.agent_role || 'agent'}`
-  const existing = answer.steps.find(item => item.id === id)
-  const result = { id, name: frame.node_name || '执行节点', role: frame.agent_role || 'Agent', output: stripLocalArtifactReferences(frame.output), open: existing?.open || false }
-  if (existing) Object.assign(existing, result)
-  else answer.steps.push(result)
-}
 function outcomeLabel(outcome) {
   return ({ approved: '通过并继续', revise: '要求修改', rejected: '拒绝', needs_revision: '要求修改' })[outcome] || outcome
 }
@@ -156,26 +164,28 @@ async function streamRun(runId, answer) {
   const response = await fetch(`/api/public/${token}/runs/${runId}/events?after_event=${answer.eventCursor || 0}`)
   if (!response.ok) throw new Error((await response.json()).detail || '无法读取执行状态')
   const reader = response.body.getReader(), decoder = new TextDecoder(); let buffer = ''
+  const batcher = createRunFrameBatcher((frame) => {
+    applyRunFrame(answer, frame)
+    if (frame.type === 'approval.required') {
+      approval.value = { runId, message: frame.message || '请审核当前结果', output: frame.output || '', outcomes: frame.outcomes || ['approved', 'revise'], defaultOutcome: frame.default_outcome || '', eventCursor: answer.eventCursor || 0 }
+      answer.text = '流程已暂停，等待你的审核。'
+    }
+    if (frame.type === 'run.completed') answer.done = true
+    if (frame.type === 'run.waiting_input') answer.done = true
+    if (frame.type === 'run.failed') answer.done = true
+    scroll()
+  })
   while (true) {
     const { done, value } = await reader.read(); buffer += decoder.decode(value || new Uint8Array(), { stream: !done })
     const blocks = buffer.split(/\r?\n\r?\n/); buffer = blocks.pop() || ''
     for (const block of blocks) {
       const raw = eventData(block); if (!raw) continue
       const frame = JSON.parse(raw)
-      if (Number.isFinite(frame.event_cursor)) answer.eventCursor = Math.max(answer.eventCursor || 0, frame.event_cursor)
-      if (frame.type === 'node.completed') mergeNodeResult(answer, frame)
-      if (frame.type === 'approval.required') { approval.value = { runId, message: frame.message || '请审核当前结果', output: frame.output || '', outcomes: frame.outcomes || ['approved','revise'], defaultOutcome: frame.default_outcome || '', eventCursor: answer.eventCursor || 0 }; answer.text = '流程已暂停，等待你的审核。' }
-      if (frame.type === 'run.completed') { answer.text = stripLocalArtifactReferences(frame.output) || '执行完成。'; answer.done = true }
-      if (frame.type === 'run.waiting_input') {
-        answer.text = stripLocalArtifactReferences(frame.question || frame.output) || '请补充必要信息。'
-        answer.waitingInput = frame.waiting_input || { question: answer.text }
-        answer.done = true
-      }
-      if (frame.type === 'run.failed') { answer.error = frame.error || '执行失败'; answer.done = true }
-      scroll()
+      batcher.push(frame)
     }
     if (done) break
   }
+  await batcher.finish()
   if (answer.done) answer.files = await fetch(`/api/public/${token}/runs/${runId}/files`).then(result => result.json()).catch(() => [])
 }
 async function send() {
@@ -184,7 +194,7 @@ async function send() {
   try { inputs = parsedInputs() } catch (cause) { error.value = cause.message; return }
   const text = message.value.trim() || (selectedFiles.value.length ? '请处理上传的文件。' : '运行应用。')
   const submittedMessage = message.value.trim()
-  const answer = reactive({ role: 'assistant', text: '', steps: [], files: [], done: false, error: '' })
+  const answer = reactive({ role: 'assistant', text: '', steps: [], turns: [], finalTurnId: '', files: [], done: false, error: '' })
   messages.value.push({ role: 'user', text, attachments: selectedFiles.value.map(item => item.file.name) }, answer)
   busy.value = true; error.value = ''; scroll()
   try {
@@ -215,9 +225,20 @@ async function approve(outcome) {
   try {
     const response = await fetch(`/api/public/${token}/runs/${approval.value.runId}/approval`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ outcome, feedback: approvalText.value }) })
     const data = await response.json(); if (!response.ok) throw new Error(data.detail || '提交失败')
-    const answer = reactive({ role: 'assistant', text: '', steps: [], files: [], done: false, error: '', eventCursor: approval.value.eventCursor || 0 }); messages.value.push(answer)
+    const answer = reactive({ role: 'assistant', text: '', steps: [], turns: [], finalTurnId: '', files: [], done: false, error: '', eventCursor: approval.value.eventCursor || 0 }); messages.value.push(answer)
     const id = approval.value.runId; approval.value = null; approvalText.value = ''; await streamRun(id, answer)
   } catch (cause) { error.value = cause.message } finally { busy.value = false }
+}
+async function retry(run) {
+  if (!isLatestRunMessage(messages.value, run) || busy.value) return
+  busy.value = true; run.error = ''; run.text = ''; run.files = []; run.turns = []; run.finalTurnId = ''; run.activity = ''; run.status = 'queued'; run.done = false
+  try {
+    const response = await fetch(`/api/public/${token}/runs/${run.runId}/retry`, { method: 'POST' })
+    const data = await response.json(); if (!response.ok) throw new Error(data.detail || '重试失败')
+    if (Number.isFinite(data.event_cursor)) run.eventCursor = data.event_cursor
+    await streamRun(run.runId, run)
+  } catch (cause) { run.error = cause.message; run.done = true }
+  finally { busy.value = false; scroll() }
 }
 </script>
 
@@ -225,22 +246,23 @@ async function approve(outcome) {
   <div v-if="loading" class="run-app-loading"><LoaderCircle class="spin" :size="22" />正在打开应用...</div>
   <div v-else-if="error&&!app" class="run-app-loading">{{ error }}</div>
   <div v-else class="chat-app-page public-chat-page has-history">
-    <header class="chat-app-header"><span class="chat-app-icon"><Bot :size="18"/></span><div class="chat-app-title"><strong>{{ app.name }}</strong><small>{{ app.kind.toUpperCase() }} · 玄枢公开应用</small></div></header>
+    <header class="chat-app-header"><span class="chat-app-icon"><img src="/xuanshu-mark.svg?v=8" alt="玄枢" /></span><div class="chat-app-title"><strong>{{ app.name }}</strong><small>{{ app.kind.toUpperCase() }} · 玄枢公开应用</small></div></header>
     <main class="chat-app-main">
       <aside class="chat-history">
         <header><strong>历史对话</strong><button class="icon-button" title="新建对话" aria-label="新建对话" @click="newConversation"><Send :size="13" /></button></header>
         <div v-if="conversations.length" class="chat-history-list">
           <article v-for="item in conversations" :key="item.id" class="chat-history-item" :class="{ active: item.id === conversationId }" @click="openConversation(item.id)">
-            <div><strong>{{ item.title || '新对话' }}</strong><small>{{ formatBeijingDateTime(item.updated_at) }}</small></div>
+            <img class="chat-history-mark" src="/xuanshu-mark.svg?v=8" alt="" /><div><strong>{{ item.title || '新对话' }}</strong><small>{{ formatBeijingDateTime(item.updated_at) }}</small></div>
             <button class="chat-history-delete" title="删除对话" aria-label="删除对话" @click.stop="deleteConversation(item)"><Trash2 :size="13" /></button>
           </article>
         </div>
         <p v-else class="chat-history-empty">暂无历史对话</p>
       </aside>
-      <section class="chat-surface"><div ref="thread" class="chat-thread"><div class="chat-thread-inner">
+      <section class="chat-surface"><div ref="thread" class="chat-thread" @scroll="onThreadScroll"><div class="chat-thread-inner">
       <article v-for="(item,index) in messages" :key="index" class="chat-message" :class="item.role"><span v-if="item.role==='assistant'" class="chat-avatar"><Bot :size="16"/></span><div class="chat-message-body"><RichMessage v-if="item.text" class="message-content" :text="item.text" :files="item.files || []" :authenticated="false"/><div v-if="item.attachments?.length" class="message-files"><span v-for="name in item.attachments" :key="name"><FileText :size="13"/>{{ name }}</span></div>
-        <div v-if="item.steps?.length" class="execution-progress"><div class="execution-progress-head">执行结果 <span>{{ item.steps.length }} 个节点</span></div><button v-for="step in item.steps" :key="step.id" class="execution-step" @click="step.open=!step.open"><span><Check :size="13"/>{{ step.role }} · {{ step.name }}</span><ChevronDown :size="13"/><pre v-if="step.open">{{ step.output }}</pre></button></div>
-        <div v-if="item.error" class="form-error">{{ item.error }}</div><div v-if="item.files?.length" class="delivery-files"><a v-for="file in item.files" :key="file.name" :href="file.url"><Download :size="14"/>{{ file.name }}</a></div><span v-if="!item.done&&!item.text&&item.role==='assistant'" class="typing-dots">•••</span></div></article>
+      <div v-if="item.turns?.length" class="agent-turn-list public-turn-list"><article v-for="turn in item.turns" :key="turn.id" class="agent-turn" :class="[turn.status, { collapsed: !turn.expanded }]" ><button class="agent-turn-head" type="button" @click="turn.expanded=!turn.expanded"><span class="agent-turn-dot" :class="turn.status"></span><span class="agent-turn-title"><strong>{{ turn.agent_role }}</strong><small>{{ turn.step_name }}</small></span><span class="agent-turn-state">{{ turn.status === 'running' ? '运行中' : turn.status === 'failed' ? '失败' : turn.status === 'waiting_input' ? '等待输入' : '已完成' }}</span><ChevronDown :size="13"/></button><div v-if="turn.expanded" class="agent-turn-body"><div v-if="turn.activity" class="agent-turn-activity"><span class="activity-pulse-dot"></span>{{ turn.activity }}</div><div v-if="turn.tools?.length" class="agent-turn-tools"><div v-for="tool in turn.tools" :key="tool.id" class="agent-turn-tool" :class="tool.status"><LoaderCircle v-if="tool.status === 'running'" class="spin" :size="11"/><Check v-else-if="tool.status === 'completed'" :size="11"/><X v-else :size="11"/><span><strong>{{ tool.name }}</strong><small>{{ tool.detail }}</small></span></div></div><RichMessage v-if="turn.output && turn.status !== 'running'" class="agent-turn-output agent-turn-rich-output" :text="turn.output" :authenticated="false"/><pre v-else-if="turn.output" class="agent-turn-output">{{ turn.output }}</pre><span v-if="turn.status === 'running'" class="stream-caret"></span></div></article></div>
+        <div v-if="item.activity && !item.turns?.length" class="run-current-activity"><span class="activity-pulse-dot"></span>{{ item.activity }}</div>
+        <div v-if="item.error" class="form-error">{{ item.error }}</div><button v-if="isLatestRunMessage(messages, item) && item.done && ['completed', 'failed', 'waiting_input'].includes(item.status)" class="chat-round-retry" type="button" title="重试这一轮" aria-label="重试这一轮" :disabled="busy" @click="retry(item)"><RotateCcw :size="12" /></button><div v-if="item.files?.length" class="delivery-files"><a v-for="file in item.files" :key="file.name" :href="file.url"><Download :size="14"/>{{ file.name }}</a></div><span v-if="!item.done&&!item.text&&item.role==='assistant'" class="typing-dots">•••</span></div></article>
       <section v-if="approval" class="feedback-gate"><h3>需要人工审核</h3><p>{{ approval.message }}</p><pre>{{ approval.output }}</pre><textarea v-model="approvalText" placeholder="填写审核意见（可选）"></textarea><div><button v-for="outcome in approval.outcomes" :key="outcome" class="button" :class="{primary:outcome==='approved'}" @click="approve(outcome)">{{ outcomeLabel(outcome) }}</button></div></section>
     </div></div><footer class="chat-composer public-composer">
       <div v-if="extraInputs.length" class="public-run-fields"><label v-for="input in extraInputs" :key="input.name"><span>{{ input.label }}<em v-if="input.required">必填</em></span><textarea v-if="input.input_type==='long_text'||input.input_type==='json'" v-model="values[input.name]" :placeholder="input.description"></textarea><span v-else-if="input.input_type==='boolean'" class="chat-variable-switch"><input v-model="values[input.name]" type="checkbox"/>启用</span><input v-else v-model="values[input.name]" :type="input.input_type==='number'?'number':'text'" :placeholder="input.description"/></label></div>

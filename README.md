@@ -11,16 +11,18 @@ Applications can be built as either Crews or Flows. Crews are suited to one-shot
 ## Features
 
 - **Natural-language orchestration**: progressively produces an executable definition through discovery, input confirmation, architecture confirmation, generation, and validation.
-- **Visual canvas editor**: directly add and connect Agent, Task, Crew, Router, Code, and human-approval nodes.
+- **Visual canvas editor**: add Agent, Task, Crew, Router, Code, Tool, and human-approval nodes, with explicit input bindings and searchable variable insertion.
 - **Crew and Flow support**: build sequential or hierarchical Crews, as well as Flows with explicit state, branching, approvals, and `ask_user` interactions.
 - **Model connections**: manage providers, model names, Base URLs, API keys, timeouts, retries, and reasoning parameters per workspace.
 - **Skills, Tools, and knowledge bases**: bind standard Skills, HTTP tools, remote MCP servers, isolated Python tools, Connected Apps, and vector knowledge bases to Agents.
 - **Multi-turn execution**: only Agents with `ask_user` explicitly enabled can pause for user input; execution resumes in the same conversation from a persisted checkpoint.
-- **Publishing and API access**: provide internal applications, anonymous public chat pages, and API-key-protected programmatic endpoints.
+- **Publishing and API access**: provide internal applications, anonymous public chat pages, and API-key-protected endpoints with blocking, streaming, and asynchronous responses.
 - **Execution observability**: inspect node status, final output, approvals, generated files, event streams, and Traces.
 - **Isolated execution**: code runs in a separate executor container that can only access the current application's workspace; resources and credentials are isolated by workspace.
 
 ## Screenshots
+
+Captured from the current interface with demonstration data. Credentials and private conversations are not included.
 
 ### Workspace Dashboard
 
@@ -30,7 +32,11 @@ Applications can be built as either Crews or Flows. Crews are suited to one-shot
 
 ![XuanShu Studio](docs/screenshots/desktop-studio.png)
 
-### Application Run and Node Progress
+Before generation, Studio opens the natural-language conversation automatically. Earlier messages load as you scroll upward.
+
+![Natural-language conversation](docs/screenshots/desktop-studio-chat.png)
+
+### Application Run and File Delivery
 
 ![Application run view](docs/screenshots/desktop-app-run.png)
 
@@ -41,6 +47,10 @@ Applications can be built as either Crews or Flows. Crews are suited to one-shot
 ![Knowledge-base management](docs/screenshots/desktop-knowledge.png)
 
 ![Skills and Tools](docs/screenshots/desktop-resources.png)
+
+### API Integration
+
+![API response modes and conversation examples](docs/screenshots/desktop-api.png)
 
 A responsive mobile interface is also included:
 
@@ -94,11 +104,13 @@ PostgreSQL persists run ownership and checkpoints, while Redis handles queues an
 | --- | --- |
 | One-shot sequential collaboration such as research, writing, and review | `Crew` + `sequential` |
 | A manager should delegate work through a hierarchy | `Crew` + `hierarchical` |
-| Conditional branches, loops, or human approvals are required | `Flow` |
+| Conditional branches or human approvals are required | `Flow` |
 | The application must ask follow-up questions and pause/resume | `Flow`, or a Crew Agent with `ask_user` explicitly enabled |
 | Several Crews must be chained together | `Flow` |
 
 Multi-turn mode does not automatically convert every node into a Flow. Only an Agent bound to the platform `ask_user` tool can ask the user a question. Conversation messages are delivered through the platform message channel and are not treated as arbitrary custom run inputs.
+
+Flow graphs must be acyclic. Router nodes choose which downstream nodes run. Approval revision re-executes the reviewed node with feedback; backward edges and graph loops are rejected at save/publish time. Skills are assigned by the design model and reviewed against Agent responsibilities; selecting an application capability does not automatically attach it to every Agent.
 
 ## Quick Start with Docker
 
@@ -145,6 +157,8 @@ On first startup, XuanShu initializes the database, workspace directories, and a
 
 Production data is stored inside the project under `data/postgres`, `data/redis`, `data/minio`, `data/qdrant`, and `data/workspaces`. These directories are ignored by Git. The Compose `data-init` service creates them and sets their permissions on first startup. Do not commit runtime data to GitHub.
 
+Back up the database, object storage, and application workspace before upgrading. The `schema-init` service applies tracked Alembic migrations automatically. Keep the existing `ENCRYPTION_KEY` when upgrading an existing deployment so saved credentials remain readable.
+
 ### 4. First Run
 
 1. Sign in with the administrator account.
@@ -159,7 +173,7 @@ Production data is stored inside the project under `data/postgres`, `data/redis`
 The development override mounts source code into the containers while reusing the data volumes from the production Compose definition:
 
 ```bash
-docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d --no-build
+docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d --build
 ```
 
 Restart backend services after changing the backend, Worker, or executor:
@@ -190,7 +204,7 @@ Stop services while retaining persisted data:
 docker compose down
 ```
 
-Do not run `docker compose down -v` without a backup. It removes PostgreSQL, Redis, MinIO, Qdrant, and application-workspace data.
+Do not delete `data/` or run `docker compose down -v` without a backup. This repository uses bind mounts under `data/`; `down -v` removes named volumes if any are configured, while bind-mounted data remains until its directories are removed.
 
 ## Public Application API
 
@@ -203,28 +217,50 @@ A published application provides two entry points:
 
 ```bash
 curl -X POST "http://localhost:18112/api/v1/apps/<PUBLIC_TOKEN>/files" \
+  -H "Authorization: Bearer xsk_<API_KEY>" \
+  -F "user_id=client-user-001" \
   -F "file=@./contract.docx"
 
 curl -X POST "http://localhost:18112/api/v1/apps/<PUBLIC_TOKEN>/runs" \
   -H "Authorization: Bearer xsk_<API_KEY>" \
   -H "Content-Type: application/json" \
   -d '{
+    "user_id": "client-user-001",
+    "response_mode": "blocking",
     "inputs": {
       "message": "Review this contract, focusing on payment, breach, and expiration clauses."
     },
     "files": {
-      "contract_files": ["<UPLOAD_ID>"]
-    },
-    "user_id": "client-user-001",
-    "conversation_id": "customer-session-001"
+      "files": ["<UPLOAD_ID>"]
+    }
   }'
 ```
 
-Keys under `inputs` and `files` must match the English variable names in the published input contract. `user_id` and `conversation_id` may be omitted on the first request. To resume a multi-turn application after `waiting_input`, continue with the same conversation.
+Every request must explicitly provide a stable `user_id`. Omit `conversation_id` on the first run and use the ID returned by the server on later requests. Input keys must match the published contract; uploads are normally bound to the `files` field.
+
+The default `response_mode` is `blocking`: the POST returns the current reply after completion, an input question, or approval pause. `streaming` returns SSE directly from the same POST (use `curl -N`); `async` immediately returns the queued task and `events_url`. Blocking waits up to 120 seconds by default, configurable with `wait_timeout_seconds` (1–300). On timeout, `wait_timed_out: true`, `status_url`, and `events_url` allow continued retrieval; the task continues in the background. Existing clients that expect immediate queue submission should explicitly set `response_mode: "async"`.
+
+### Second and Later Turns
+
+`conversation_id` belongs at the **top level** of the JSON body, alongside `user_id` and `inputs`. It is not an input variable or a URL parameter. Do not substitute the response's run `id` for the conversation ID.
+
+```bash
+curl -X POST "http://localhost:18112/api/v1/apps/<PUBLIC_TOKEN>/runs" \
+  -H "Authorization: Bearer xsk_<API_KEY>" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "user_id": "client-user-001",
+    "conversation_id": "<CONVERSATION_ID_FROM_PREVIOUS_RESPONSE>",
+    "response_mode": "blocking",
+    "inputs": {"message": "Focus on the payment schedule and breach penalties."},
+    "files": {"files": []}
+  }'
+```
+
+When status is `waiting_input`, `output` and `waiting_input.question` contain the Agent's question. Reply with the same user/conversation identity. An empty new-upload array retains previous attachments. Streaming exposes the conversation ID in `run.accepted` and the final/pause frame's `result`.
 
 | Method | Path | Purpose |
 | --- | --- | --- |
-| `GET` | `/api/v1/apps/{token}` | Get the public application description and input contract |
 | `POST` | `/api/v1/apps/{token}/files` | Upload a temporary file |
 | `POST` | `/api/v1/apps/{token}/runs` | Create a run |
 | `GET` | `/api/v1/apps/{token}/runs/{run_id}` | Get status, node outputs, and files |
@@ -235,6 +271,17 @@ Keys under `inputs` and `files` must match the English variable names in the pub
 See [`docs/API.md`](docs/API.md) for the complete API reference.
 
 ## Resources and Execution Security
+
+Executor resource limits are configurable through `.env`:
+
+| Variable | Default | Scope |
+| --- | --- | --- |
+| `EXECUTOR_MEMORY_LIMIT` | `1g` | Total executor container memory |
+| `EXECUTOR_CPU_LIMIT` | `1.0` | Total executor CPU quota |
+| `EXECUTOR_PIDS_LIMIT` | `128` | Total executor processes/threads |
+| `CODE_TIMEOUT_SECONDS` | `60` | Per command execution timeout |
+
+After changing container limits, recreate the executor with `docker compose up -d --no-deps --force-recreate executor`. The executor includes Fontconfig (`fc-list`) for font inspection; specific commercial fonts are not bundled.
 
 - Applications, Agents, Tasks, inputs, runs, model connections, and resources belong to a workspace.
 - Model API keys and HTTP/MCP tokens and headers are encrypted at rest; management APIs never return plaintext credentials.
@@ -265,6 +312,7 @@ xuanshu_platform/
 ├── worker/                 # Application Worker and Studio Worker
 ├── executor/               # Separate isolated execution service
 ├── frontend/src/           # Vue 3, Pinia, and Vue Router frontend
+├── alembic/                # Tracked database migrations
 ├── docs/API.md             # Public API reference
 ├── docs/screenshots/       # README screenshots
 ├── data/                   # Docker persistent data (runtime content is ignored)
@@ -273,9 +321,18 @@ xuanshu_platform/
 └── pyproject.toml          # Python dependencies and CrewAI Flow configuration
 ```
 
-## Deployment Checks
+## Build and Deployment Checks
 
-The open-source package does not include test code or local development caches. After deployment, verify the services with:
+Python dependencies use `uv`; supported Python versions are 3.10–3.13. Frontend development requires Node.js 22 or newer.
+
+```bash
+uv sync --no-dev
+cd frontend
+npm ci
+npm run build
+```
+
+After deployment, verify the services with:
 
 ```bash
 curl http://localhost:18112/api/health
@@ -315,10 +372,13 @@ Files must be written under `$XUANSHU_WORKSPACE`, where the platform collects ex
 
 `schema-init` initializes and migrates the database schema. Weak production credentials are rejected during initialization. After changing `.env`, restart the affected services; do not delete data volumes as a configuration workaround.
 
+Manual migration: `uv run alembic upgrade head`.
+
 ## Documentation
 
 - [`docs/API.md`](docs/API.md): public API, conversations, SSE, approvals, and file downloads.
 - [`docs/LEGACY_PARITY.md`](docs/LEGACY_PARITY.md): feature migration matrix and runtime semantics.
+- [`docs/run-event-protocol.md`](docs/run-event-protocol.md): SSE cursors, retry attempts, parallel node states, and frontend reducers.
 - [CrewAI documentation](https://docs.crewai.com/): Agent, Task, Crew, Flow, Skill, and Tool reference.
 
 ## License and Deployment Notes

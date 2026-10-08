@@ -9,10 +9,20 @@ from .db import (
     Application, ApplicationAgent, ApplicationAgentResource, ApplicationInput,
     ApplicationTask, ApplicationTaskDependency,
 )
-
-
 def _dict(value):
     return dict(value) if isinstance(value, dict) else {}
+
+
+def _remove_crew_rate_limits(document: dict) -> dict:
+    document.pop('max_rpm', None)
+    for task in document.get('tasks', []) or []:
+        if not isinstance(task, dict):
+            continue
+        task.pop('crew_max_rpm', None)
+        for nested in task.get('crew_tasks', []) or []:
+            if isinstance(nested, dict):
+                nested.pop('crew_max_rpm', None)
+    return document
 
 
 async def read_application(db, row: Application) -> dict:
@@ -21,17 +31,18 @@ async def read_application(db, row: Application) -> dict:
     inputs = (await db.scalars(select(ApplicationInput).where(ApplicationInput.application_id == row.id).order_by(ApplicationInput.position, ApplicationInput.id))).all()
     dependencies = (await db.scalars(select(ApplicationTaskDependency).where(ApplicationTaskDependency.application_id == row.id))).all()
     resources = (await db.scalars(select(ApplicationAgentResource).where(ApplicationAgentResource.application_id == row.id))).all()
-    app_config = _dict(row.config)
+    app_config = _remove_crew_rate_limits(_dict(row.config))
 
     dependency_map = {}
     for item in dependencies:
-        dependency_map.setdefault(item.task_key, []).append(item.depends_on_key)
+        dependency_map.setdefault(item.node_key, []).append(item.depends_on_node_key)
     resource_map = {}
     for item in resources:
         resource_map.setdefault(item.agent_key, {}).setdefault(item.resource_type, []).append(str(item.resource_id))
     agent_docs = []
     for item in agents:
         config = _dict(item.config)
+        config.pop('crew_max_rpm', None)
         goal = item.goal or '完成分配任务'
         role = item.role or '任务专家'
         config.update({
@@ -55,9 +66,9 @@ async def read_application(db, row: Application) -> dict:
             if isinstance(nested, dict):
                 nested.pop('human_input', None)
         config.update({
-            'id': item.task_key, 'name': item.name, 'description': item.description,
+            'id': item.node_key, 'name': item.name, 'description': item.description,
             'expected_output': item.expected_output, 'agent_id': item.agent_key,
-            'node_type': item.node_type, 'depends_on': dependency_map.get(item.task_key, []),
+            'node_type': item.node_type, 'depends_on': dependency_map.get(item.node_key, []),
             'position': {'x': item.position_x, 'y': item.position_y},
         })
         task_docs.append(config)
@@ -65,7 +76,7 @@ async def read_application(db, row: Application) -> dict:
     if not description:
         task_subject = next((str(item.name or '').strip() for item in tasks if str(item.name or '').strip()), '用户需求')
         description = f'面向{row.name or task_subject}提供可运行的 CrewAI 智能应用，按已确认输入完成处理并交付可验证结果。'
-    return {
+    document = {
         **app_config,
         'id': str(row.id), 'name': row.name, 'description': description,
         'kind': row.kind, 'process': row.process, 'memory': row.memory,
@@ -79,6 +90,9 @@ async def read_application(db, row: Application) -> dict:
             'required': x.required, 'multiple': x.multiple, 'description': x.description,
         } for x in inputs],
     }
+    # IDs are stored as the workflow contract. Do not renumber or infer them
+    # while reading relational data.
+    return _remove_crew_rate_limits(document)
 
 
 async def read_published_application(db, row: Application) -> dict:
@@ -88,7 +102,7 @@ async def read_published_application(db, row: Application) -> dict:
     normalized graph until the next explicit publish, preserving compatibility
     while new edits are isolated once a snapshot exists.
     """
-    snapshot = _dict(getattr(row, 'published_config', {}))
+    snapshot = _remove_crew_rate_limits(_dict(getattr(row, 'published_config', {})))
     if not snapshot:
         return await read_application(db, row)
     return {
@@ -105,6 +119,7 @@ async def read_published_application(db, row: Application) -> dict:
 
 
 async def write_application(db, row: Application, document: dict) -> None:
+    document = _remove_crew_rate_limits(dict(document))
     row.name = str(document.get('name') or row.name)
     row.kind = document.get('kind', row.kind)
     row.description = document.get('description', '')
@@ -112,7 +127,13 @@ async def write_application(db, row: Application, document: dict) -> None:
     row.memory = bool(document.get('memory', False))
     row.planning = bool(document.get('planning', False))
     excluded = {'id', 'name', 'description', 'kind', 'process', 'memory', 'planning', 'agents', 'tasks', 'inputs', 'status'}
-    row.config = {key: value for key, value in document.items() if key not in excluded}
+    row.config = {
+        key: value for key, value in document.items() if key not in excluded
+    }
+    # The relational graph now stores the public node IDs verbatim. This
+    # marker makes the one-time legacy migration idempotent for newly saved
+    # applications as well.
+    row.config['node_storage_version'] = 2
     await db.execute(delete(ApplicationInput).where(ApplicationInput.application_id == row.id))
     await db.execute(delete(ApplicationAgentResource).where(ApplicationAgentResource.application_id == row.id))
     await db.execute(delete(ApplicationTaskDependency).where(ApplicationTaskDependency.application_id == row.id))
@@ -140,13 +161,15 @@ async def write_application(db, row: Application, document: dict) -> None:
                 except (TypeError, ValueError):
                     continue
     for position, item in enumerate(document.get('tasks', []) or []):
-        key = item.get('id', f'task_{position + 1}')
+        key = str(item.get('id') or '').strip()
+        if not key:
+            raise ValueError(f'工作流节点 {position + 1} 缺少稳定 id')
         pos = item.get('position') or {}
-        known = {'id', 'name', 'description', 'expected_output', 'agent_id', 'node_type', 'depends_on', 'position'}
-        db.add(ApplicationTask(application_id=row.id, task_key=key, name=item.get('name', f'执行步骤 {position + 1}'),
+        known = {'id', 'name', 'description', 'expected_output', 'agent_id', 'node_type', 'depends_on', 'position', 'crew_max_rpm'}
+        db.add(ApplicationTask(application_id=row.id, node_key=key, name=item.get('name', f'执行步骤 {position + 1}'),
                                 description=item.get('description', ''), expected_output=item.get('expected_output', ''),
                                 agent_key=item.get('agent_id'), node_type=item.get('node_type', 'task'),
                                 config={k: v for k, v in item.items() if k not in known}, position_x=int(pos.get('x', 430)),
                                 position_y=int(pos.get('y', 80 + position * 210))))
         for dependency in item.get('depends_on', []) or []:
-            db.add(ApplicationTaskDependency(application_id=row.id, task_key=key, depends_on_key=dependency))
+            db.add(ApplicationTaskDependency(application_id=row.id, node_key=key, depends_on_node_key=str(dependency)))

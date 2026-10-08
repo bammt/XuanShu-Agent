@@ -135,7 +135,7 @@ function submit() {
   display: block;
   margin-bottom: 2px;
   color: var(--subtle);
-  font-size: 9px;
+  font-size: 12px;
   font-weight: 750;
   text-transform: uppercase;
 }
@@ -159,12 +159,12 @@ function submit() {
 .automation-details-body > p {
   margin: 0;
   color: var(--muted);
-  font-size: 11px;
+  font-size: 13px;
   line-height: 1.65;
 }
 .automation-details-body .field > span {
   color: #4f5752;
-  font-size: 10px;
+  font-size: 13px;
   font-weight: 750;
 }
 .automation-details-body textarea {
@@ -172,6 +172,6 @@ function submit() {
 }
 .automation-details-hint {
   color: #9c4d42;
-  font-size: 10px;
+  font-size: 13px;
 }
 </style>

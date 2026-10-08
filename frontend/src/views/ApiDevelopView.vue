@@ -5,6 +5,7 @@ import { ArrowLeft, Check, Copy, ExternalLink, KeyRound, Plus, Trash2 } from 'lu
 import { api } from '../services/api'
 import { usePlatformStore } from '../stores/platform'
 import { formatBeijingDateTime } from '../services/dateFormatting'
+import { copyText } from '../services/clipboard.js'
 
 const route = useRoute()
 const router = useRouter()
@@ -14,6 +15,7 @@ const newKey = ref(null)
 const keyName = ref('生产调用')
 const loading = ref(true)
 const copied = ref('')
+const responseMode = ref('blocking')
 const workflow = computed(() => store.workflows.find(item => item.id === route.params.id))
 const token = computed(() => workflow.value?.public_token || '')
 const origin = window.location.origin
@@ -25,7 +27,14 @@ const sampleInputs = computed(() => Object.fromEntries((workflow.value?.inputs |
 const sampleFiles = computed(() => Object.fromEntries((workflow.value?.inputs || [])
   .filter(item => ['file', 'image'].includes(item.input_type))
   .map(item => [item.name, ['UPLOAD_ID']])))
-const runBody = computed(() => JSON.stringify({ inputs: sampleInputs.value, files: sampleFiles.value }, null, 2))
+const runBody = computed(() => JSON.stringify({ user_id: 'client-user-001', response_mode: responseMode.value, inputs: sampleInputs.value, files: sampleFiles.value }, null, 2))
+const continueBody = computed(() => JSON.stringify({
+  user_id: 'client-user-001',
+  conversation_id: 'CONVERSATION_ID_FROM_PREVIOUS_RESPONSE',
+  response_mode: responseMode.value,
+  inputs: { message: '这里填写对上一轮追问的回复或后续需求' },
+  files: Object.fromEntries(Object.keys(sampleFiles.value).map(name => [name, []])),
+}, null, 2))
 
 onMounted(async () => {
   await store.load()
@@ -41,8 +50,14 @@ async function removeKey(id) {
   keys.value = keys.value.filter(item => item.id !== id)
 }
 async function copy(value, label) {
-  await navigator.clipboard.writeText(value); copied.value = label
-  window.setTimeout(() => { copied.value = '' }, 1600)
+  copied.value = ''
+  try {
+    await copyText(value)
+    copied.value = label
+    window.setTimeout(() => { if (copied.value === label) copied.value = '' }, 1600)
+  } catch (error) {
+    store.error = error.message || '复制失败，请选中内容手动复制'
+  }
 }
 </script>
 
@@ -61,15 +76,21 @@ async function copy(value, label) {
         <section><h3>1. 上传文件</h3><p>文件类变量先上传，必须显式传 <code>user_id</code>；返回的 <code>id</code> 可在该用户拥有的任意后续会话中引用，文件默认保留 30 天。</p><pre>curl -X POST '{{ basePath }}/files' \
   -H 'Authorization: Bearer YOUR_API_KEY' \
   -F 'user_id=USER_ID' -F 'file=@./document.pdf'</pre></section>
-        <section><h3>2. 发起运行</h3><p>API 必须显式传 <code>user_id</code>；第一次调用省略 <code>conversation_id</code>，响应会返回会话 ID。后续多轮请求带回同一用户 ID 和会话 ID。变量必须使用编排时确认的英文变量名。</p><pre>curl -X POST '{{ basePath }}/runs' \
+        <section><h3>2. 发起运行</h3><div class="develop-response-modes" role="group" aria-label="响应方式"><button v-for="mode in [{value:'blocking',label:'等待回复'},{value:'streaming',label:'流式回复'},{value:'async',label:'异步任务'}]" :key="mode.value" class="button" :class="{primary:responseMode===mode.value}" :aria-pressed="responseMode===mode.value" @click="responseMode=mode.value">{{ mode.label }}</button></div><p>默认等待本轮回复后返回 JSON；<code>streaming</code> 直接返回 SSE；<code>async</code> 立即返回任务 ID。等待回复默认上限 120 秒，超时可通过 <code>status_url</code> 或 <code>events_url</code> 继续获取结果。API 必须显式传 <code>user_id</code>；第一次调用省略 <code>conversation_id</code>，响应会返回会话 ID。后续多轮请求带回同一用户 ID 和会话 ID。变量必须使用编排时确认的英文变量名。</p><pre>curl {{ responseMode === 'streaming' ? '-N ' : '' }}-X POST '{{ basePath }}/runs' \
   -H 'Authorization: Bearer YOUR_API_KEY' \
   -H 'Content-Type: application/json' \
-  -d '{{ runBody }}'</pre></section>
-        <section><h3>3. 查询与流式事件</h3><p>创建运行、查询、事件流和文件下载都必须显式提供 <code>user_id</code>；API 不会从 Cookie 推断调用方身份。</p><pre>curl -H 'Authorization: Bearer YOUR_API_KEY' \
+  -d '{{ runBody }}'</pre><p>如果状态为 <code>waiting_input</code>，<code>output</code> 和 <code>waiting_input.question</code> 是智能体的追问。补充信息时携带返回的 <code>conversation_id</code> 再次 POST；不要省略它，否则会创建新对话。</p></section>
+        <section><h3>第二轮及后续请求</h3><p><code>conversation_id</code> 放在 JSON 请求体顶层，与 <code>user_id</code>、<code>inputs</code> 同级，不能放进 <code>inputs</code>。替换为上一轮响应返回的会话 ID，并保持同一个 <code>user_id</code>。流式调用从 <code>run.accepted</code> 或最后一帧的 <code>result.conversation_id</code> 获取会话 ID。后续仍调用同一个 <code>POST /runs</code>。</p><pre>curl {{ responseMode === 'streaming' ? '-N ' : '' }}-X POST '{{ basePath }}/runs' \
+  -H 'Authorization: Bearer YOUR_API_KEY' \
+  -H 'Content-Type: application/json' \
+  -d '{{ continueBody }}'</pre><p><code>inputs.message</code> 填写本轮回复；没有新附件时文件数组留空，已有附件继续保留。后续响应中的 <code>id</code> 是运行 ID，不能当作会话 ID。</p></section>
+        <section><h3>3. 查询与流式事件</h3><p>创建运行、查询、事件流和文件下载都必须显式提供 <code>user_id</code>；API 不会从 Cookie 推断调用方身份。事件接口是 SSE，可以在运行尚未结束时逐条收到节点、Agent、工具和模型输出增量。</p><pre>curl -H 'Authorization: Bearer YOUR_API_KEY' \
   '{{ basePath }}/runs/RUN_ID?user_id=USER_ID'
 
 curl -N -H 'Authorization: Bearer YOUR_API_KEY' \
-  '{{ basePath }}/runs/RUN_ID/events?user_id=USER_ID'</pre></section>
+  '{{ basePath }}/runs/RUN_ID/events?user_id=USER_ID'
+
+# 典型事件：agent.started、tool.started、llm.delta、tool.completed、node.completed、run.completed</pre></section>
         <section><h3>4. 人工审批</h3><p>状态为 <code>waiting_approval</code> 时提交审批，批准后从暂停节点之后继续，不重复已完成节点。</p><pre>curl -X POST '{{ basePath }}/runs/RUN_ID/approval?user_id=USER_ID' \
   -H 'Authorization: Bearer YOUR_API_KEY' \
   -H 'Content-Type: application/json' \

@@ -6,8 +6,10 @@ import {
   ArrowLeft,
   ChevronLeft,
   ChevronRight,
+  ChevronDown,
   Clock3,
   GitBranch,
+  LoaderCircle,
   RefreshCw,
   Search,
   Trash2,
@@ -18,6 +20,7 @@ import { usePlatformStore } from '../stores/platform'
 import StatusBadge from '../components/StatusBadge.vue'
 import EmptyState from '../components/EmptyState.vue'
 import RichMessage from '../components/RichMessage.vue'
+import { expandedTraceEvents, groupTraceEvents, traceEventPayload } from '../services/traceEvents'
 import { confirmDialog } from '../services/dialog'
 import {
   formatBeijingDateTime,
@@ -36,7 +39,40 @@ const pageSize = 8
 const loading = ref(false)
 const feedback = ref('')
 const feedbackBusy = ref(false)
+const rawEventsByRun = ref({})
+const expandedGroups = ref(new Set())
+const loadingRuns = ref(new Set())
+const rawEventRequests = new Map()
 let timer
+let refreshInFlight = false
+
+const eventGroups = computed(() => groupTraceEvents(selected.value?.events || []))
+
+async function toggleEventGroup(group) {
+  const next = new Set(expandedGroups.value)
+  if (next.has(group.key)) {
+    next.delete(group.key)
+    expandedGroups.value = next
+    return
+  }
+  next.add(group.key)
+  expandedGroups.value = next
+  if (!group.runId || rawEventsByRun.value[group.runId]) return
+  if (!rawEventRequests.has(group.runId)) {
+    loadingRuns.value = new Set([...loadingRuns.value, group.runId])
+    const request = api.traceRunEvents(selected.value.id, group.runId)
+      .then((result) => { rawEventsByRun.value = { ...rawEventsByRun.value, [group.runId]: result.events || [] } })
+      .catch((error) => { store.error = error.message })
+      .finally(() => {
+        rawEventRequests.delete(group.runId)
+        const remaining = new Set(loadingRuns.value)
+        remaining.delete(group.runId)
+        loadingRuns.value = remaining
+      })
+    rawEventRequests.set(group.runId, request)
+  }
+  await rawEventRequests.get(group.runId)
+}
 
 const modeLabel = (mode) => ({
   preview: '编排预览',
@@ -50,7 +86,7 @@ const statusLabel = (status) => ({
   queued: '排队中',
   failed: '失败',
   waiting_input: '等待输入',
-  waiting_for_feedback: '等待审核',
+  waiting_approval: '等待审核',
 })[status] || status || '未知'
 
 const metric = (...keys) => {
@@ -118,6 +154,7 @@ function routeToTrace(id, replace = false) {
 async function choose(id, replace = false) {
   if (!id) return
   try {
+    if (String(selected.value?.id || '') !== String(id)) expandedGroups.value = new Set()
     selected.value = await api.trace(id)
     workflowFilter.value = String(selected.value.workflow_id || workflowFilter.value)
     const index = activeRuns.value.findIndex((item) => String(item.id) === String(id))
@@ -138,6 +175,8 @@ async function openWorkflow(card) {
 }
 
 async function refresh() {
+  if (refreshInFlight) return
+  refreshInFlight = true
   loading.value = true
   try {
     traces.value = await api.traces()
@@ -152,6 +191,32 @@ async function refresh() {
     store.error = error.message
   } finally {
     loading.value = false
+    refreshInFlight = false
+  }
+}
+
+async function refreshSummary() {
+  if (refreshInFlight) return
+  refreshInFlight = true
+  try {
+    traces.value = await api.traces()
+    const current = route.params.id
+      ? traces.value.find((item) => String(item.id) === String(route.params.id))
+      : null
+    if (current && selected.value) {
+      selected.value = {
+        ...selected.value,
+        status: current.status,
+        updated_at: current.updated_at,
+        run_count: current.run_count,
+        workflow_run_count: current.workflow_run_count,
+        metrics: current.metrics,
+      }
+    }
+  } catch (error) {
+    store.error = error.message
+  } finally {
+    refreshInFlight = false
   }
 }
 
@@ -202,7 +267,7 @@ async function removeTrace(trace) {
 onMounted(async () => {
   await refresh()
   timer = setInterval(() => {
-    if (selected.value && ['queued', 'running'].includes(selected.value.status)) refresh()
+    if (selected.value && ['queued', 'running'].includes(selected.value.status)) refreshSummary()
   }, 1800)
 })
 
@@ -291,10 +356,30 @@ watch(() => route.params.id, (id) => {
         <div class="trace-metric"><small>工作流运行</small><strong>{{ metric('workflow_runs') }}</strong></div>
         <div class="trace-metric"><small>节点事件</small><strong>{{ selected.events?.length || 0 }}</strong></div>
       </div>
-      <section v-if="selected.status === 'waiting_for_feedback'" class="feedback-gate"><header><div><span class="eyebrow">HUMAN REVIEW</span><h3>{{ selected.pending_feedback.step_name }}</h3></div><span class="tag">等待审核</span></header><p>{{ selected.pending_feedback.message }}</p><pre>{{ selected.pending_feedback.output }}</pre><textarea v-model="feedback" placeholder="添加反馈（可选）"></textarea><div><button v-for="outcome in selected.pending_feedback.outcomes" :key="outcome" class="button" :class="{ primary: outcome === 'approved' }" :disabled="feedbackBusy" @click="submitFeedback(outcome)">{{ outcome }}</button></div></section>
+      <section v-if="selected.status === 'waiting_approval'" class="feedback-gate"><header><div><span class="eyebrow">HUMAN REVIEW</span><h3>{{ selected.pending_feedback.step_name }}</h3></div><span class="tag">等待审核</span></header><p>{{ selected.pending_feedback.message }}</p><pre>{{ selected.pending_feedback.output }}</pre><textarea v-model="feedback" placeholder="添加反馈（可选）"></textarea><div><button v-for="outcome in selected.pending_feedback.outcomes" :key="outcome" class="button" :class="{ primary: outcome === 'approved' }" :disabled="feedbackBusy" @click="submitFeedback(outcome)">{{ outcome }}</button></div></section>
       <section v-else-if="selected.status === 'waiting_input'" class="feedback-gate"><header><div><span class="eyebrow">WAITING FOR USER</span><h3>等待用户补充信息</h3></div><span class="tag">已暂停</span></header><p>{{ selected.waiting_input?.question || selected.output }}</p><p class="muted">在同一会话继续发送消息后，流程会从当前节点恢复。</p></section>
       <div class="trace-section-heading"><div><span class="eyebrow">EVENTS</span><h3>执行时间线</h3></div><span class="tag">{{ selected.events?.length || 0 }} 个事件</span></div>
-      <div class="timeline"><div v-for="(event, index) in selected.events" :key="`${event.at}-${index}`" class="timeline-event"><div class="timeline-rail"><span class="timeline-dot"></span><span v-if="index < selected.events.length - 1" class="timeline-line"></span></div><div><strong>{{ event.title }}</strong><p>{{ event.detail || event.type }}</p><pre v-if="event.arguments" class="trace-event-arguments">{{ JSON.stringify(event.arguments, null, 2) }}</pre><time>{{ formatBeijingDateTime(event.at) }}</time></div></div></div>
+      <div class="trace-event-groups">
+        <section v-for="group in eventGroups" :key="group.key" class="trace-event-group" :class="{ expanded: expandedGroups.has(group.key) }">
+          <button class="trace-event-trigger" type="button" :aria-expanded="expandedGroups.has(group.key)" @click="toggleEventGroup(group)">
+            <span class="trace-event-marker" :class="group.status"></span>
+            <span class="trace-event-summary"><strong>{{ group.title }}</strong><small>{{ group.events.length }} 个事件 · {{ formatBeijingDateTime(group.events[0]?.at) }}</small></span>
+            <span class="trace-event-status">{{ statusLabel(group.status) }}</span>
+            <ChevronDown :size="16" class="trace-event-chevron" />
+          </button>
+          <div v-if="expandedGroups.has(group.key)" class="trace-event-details">
+            <div v-if="loadingRuns.has(group.runId) && !rawEventsByRun[group.runId]" class="trace-event-loading"><LoaderCircle class="spin" :size="16" />正在读取完整事件…</div>
+            <template v-else-if="rawEventsByRun[group.runId]">
+              <article v-for="(event, index) in expandedTraceEvents(group, rawEventsByRun[group.runId])" :key="`${event.event_index}-${index}`" class="trace-event-entry">
+                <header><span>{{ event.type }}</span><time>{{ formatBeijingDateTime(event.at) }}</time></header>
+                <pre v-if="traceEventPayload(event)">{{ traceEventPayload(event) }}</pre>
+                <p v-else>{{ event.detail || '事件已记录' }}</p>
+              </article>
+            </template>
+            <div v-else class="trace-event-loading">完整事件读取失败，请再次点击展开。</div>
+          </div>
+        </section>
+      </div>
       <div class="trace-section-heading"><div><span class="eyebrow">OUTPUT</span><h3>{{ selected.status === 'failed' ? '错误信息' : '最终输出' }}</h3></div><span class="tag">{{ statusLabel(selected.status) }}</span></div>
       <RichMessage class="output-box" :text="selected.error || selected.output || (selected.status === 'running' ? '正在运行…' : '等待输出…')" :files="selected.files || []" />
     </main>

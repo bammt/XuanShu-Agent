@@ -37,4 +37,9 @@ def persistent_memory(path: Path, llm, root_scope: str) -> Memory:
         storage=LanceDBStorage(path=path, vector_dim=384),
         embedder=LocalEmbeddingFunction(),
         root_scope=root_scope,
+        # Composer memory records already provide explicit scope, category and
+        # importance. Disable similarity consolidation so CrewAI does not make
+        # a hidden structured LLM call that many OpenAI-compatible gateways
+        # reject with ``response_format unavailable``.
+        consolidation_threshold=1.0,
     )

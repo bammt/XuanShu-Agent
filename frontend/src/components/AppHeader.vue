@@ -7,8 +7,9 @@ import { usePlatformStore } from '../stores/platform'
 const route = useRoute(); const router = useRouter()
 const store = usePlatformStore()
 const canEdit = computed(() => store.canEdit)
+const showCreateAgent = computed(() => canEdit.value && Boolean(route.meta.agentWorkspace))
 const title = computed(() => route.meta.title || '玄枢编排台')
-const eyebrow = computed(() => route.meta.eyebrow || 'WORKSPACE')
+const eyebrow = computed(() => route.meta.eyebrow || '工作台')
 function logout(){localStorage.removeItem('xuanshu_token');localStorage.removeItem('xuanshu_workspace');localStorage.removeItem('xuanshu_user');router.push('/login')}
 async function switchWorkspace(event){localStorage.setItem('xuanshu_workspace',event.target.value);await store.load();router.push('/')}
 </script>
@@ -20,7 +21,7 @@ async function switchWorkspace(event){localStorage.setItem('xuanshu_workspace',e
       <select class="workspace-switcher" :value="store.currentWorkspace?.id" @change="switchWorkspace"><option v-for="item in store.workspaces" :key="item.id" :value="item.id">{{ item.name }}</option></select>
       <button class="icon-button" title="通知"><Bell :size="18" /></button>
       <button class="icon-button" title="退出登录" @click="logout"><LogOut :size="18" /></button>
-      <button v-if="canEdit" class="button primary" @click="router.push('/new-automation')"><Plus :size="16" />新建智能体</button>
+      <button v-if="showCreateAgent" class="button primary" @click="router.push('/new-automation')"><Plus :size="16" />新建智能体</button>
     </div>
   </header>
 </template>

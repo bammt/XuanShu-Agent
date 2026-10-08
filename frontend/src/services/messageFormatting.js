@@ -8,6 +8,18 @@ export function stripLocalArtifactReferences(value = "", options = {}) {
   return options.trim === false ? result : result.trim();
 }
 
+export function normalizeEscapedControlCharacters(value = "") {
+  return String(value || "")
+    .replace(/\\\\r\\\\n/g, "\n")
+    .replace(/\\\\n/g, "\n")
+    .replace(/\\\\r/g, "\r")
+    .replace(/\\\\t/g, "\t")
+    .replace(/\\r\\n/g, "\n")
+    .replace(/\\n/g, "\n")
+    .replace(/\\r/g, "\r")
+    .replace(/\\t/g, "\t");
+}
+
 function escapeHtml(value = "") {
   return String(value)
     .replace(/&/g, "&amp;")
@@ -50,7 +62,8 @@ function tableHtml(lines) {
 }
 
 export function renderRichMessage(value = "") {
-  const escaped = escapeHtml(stripLocalArtifactReferences(value));
+  const normalized = normalizeEscapedControlCharacters(value);
+  const escaped = escapeHtml(stripLocalArtifactReferences(normalized));
   const tokens = escaped.split(/(```[^\n]*\n[\s\S]*?```)/g).filter(Boolean);
   return tokens.map((token) => {
     const fenced = token.match(/^```[^\n]*\n([\s\S]*?)\n?```$/);

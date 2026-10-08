@@ -11,16 +11,18 @@
 ## 功能概览
 
 - **自然语言编排**：按信息收集、输入确认、架构确认和生成校验逐步形成可运行定义。
-- **画布编辑**：直接添加和连接 Agent、Task、Crew、Router、Code、人工审批等节点。
+- **画布编辑**：直接添加 Agent、Task、Crew、Router、Code、Tool、人工审批等节点，支持显式输入绑定与变量搜索插入。
 - **Crew 与 Flow**：支持顺序/层级 Crew，以及显式状态、分支、审批和 `ask_user` 的 Flow。
 - **模型连接**：按工作空间管理供应商、模型、Base URL、API Key、超时、重试和思考参数。
 - **Skills、Tools、知识库**：为 Agent 绑定标准 Skill、HTTP/远程 MCP/隔离 Python/Connected App 工具和向量知识库。
 - **多轮运行**：只有显式启用 `ask_user` 的 Agent 才会暂停等待用户；恢复时复用同一会话和运行检查点。
-- **发布与调用**：支持内部应用、匿名公开聊天页和带 API Key 的程序接口。
+- **发布与调用**：支持内部应用、匿名公开聊天页和带 API Key 的程序接口，提供等待回复、流式回复、异步任务三种响应方式。
 - **运行观测**：查看节点状态、最终输出、审批、交付文件、事件流和 Trace。
 - **安全执行**：代码在独立 executor 容器中运行，仅能访问当前应用工作目录；资源和凭据按工作空间隔离。
 
 ## 界面预览
+
+截图来自当前界面，使用演示数据，不包含真实凭据或私人会话。
 
 ### 工作空间控制台
 
@@ -30,7 +32,11 @@
 
 ![玄枢编排台](docs/screenshots/desktop-studio.png)
 
-### 应用运行与节点进度
+应用尚未生成时默认打开自然语言编排窗口；聊天记录向上滚动时分页加载更早消息。
+
+![自然语言编排会话](docs/screenshots/desktop-studio-chat.png)
+
+### 应用运行与文件交付
 
 ![应用运行界面](docs/screenshots/desktop-app-run.png)
 
@@ -41,6 +47,10 @@
 ![知识库管理](docs/screenshots/desktop-knowledge.png)
 
 ![Skills 与 Tools](docs/screenshots/desktop-resources.png)
+
+### API 接入
+
+![API 响应模式与后续会话示例](docs/screenshots/desktop-api.png)
 
 移动端也提供响应式界面：
 
@@ -94,11 +104,13 @@ PostgreSQL 负责运行领取和检查点持久化，Redis 负责队列与运行
 | --- | --- |
 | 一次性完成研究、写作、审查等顺序协作 | `Crew` + `sequential` |
 | 需要负责人分配任务或层级管理 | `Crew` + `hierarchical` |
-| 需要条件分支、循环、人工审批 | `Flow` |
+| 需要条件分支、人工审批 | `Flow` |
 | 需要多轮追问并暂停恢复 | `Flow`，或在 Crew 的 Agent 上显式启用 `ask_user` |
 | 需要多个 Crew 串联 | `Flow` |
 
 多轮模式不是自动把所有节点变成 Flow；只有绑定平台 `ask_user` 的 Agent 才能提问。平台消息通过会话通道传入，不会被错误地当作用户自定义运行输入变量。
+
+Flow 图必须无环，Router 决定下游执行或跳过；审批修改会携带反馈重做当前节点，保存和发布时拒绝回边循环。Skill 由编排模型按实际职责绑定，并在生成阶段审查；选择应用能力不会自动把资源附加到每个 Agent。
 
 ## 快速开始（Docker）
 
@@ -159,7 +171,7 @@ docker compose ps
 开发覆盖配置把源码映射进容器，数据卷仍复用生产 Compose 定义：
 
 ```bash
-docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d --no-build
+docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d --build
 ```
 
 修改后端、Worker 或 executor 后重启：
@@ -190,7 +202,7 @@ docker compose logs -f executor
 docker compose down
 ```
 
-不要在没有备份时使用 `docker compose down -v`，它会删除 PostgreSQL、Redis、MinIO、Qdrant 和应用工作目录数据。
+不要在没有备份时删除 `data/` 或使用 `docker compose down -v`。本仓库使用 `data/` 绑定挂载，`down -v` 会删除命名卷（若已配置），绑定目录中的数据仍保留，直到目录被删除。升级前备份数据库、对象存储和应用工作目录，并保留原 `ENCRYPTION_KEY`，避免已保存凭据无法解密。
 
 ## 公开应用 API
 
@@ -203,28 +215,50 @@ docker compose down
 
 ```bash
 curl -X POST "http://localhost:18112/api/v1/apps/<PUBLIC_TOKEN>/files" \
+  -H "Authorization: Bearer xsk_<API_KEY>" \
+  -F "user_id=client-user-001" \
   -F "file=@./合同.docx"
 
 curl -X POST "http://localhost:18112/api/v1/apps/<PUBLIC_TOKEN>/runs" \
   -H "Authorization: Bearer xsk_<API_KEY>" \
   -H "Content-Type: application/json" \
   -d '{
+    "user_id": "client-user-001",
+    "response_mode": "blocking",
     "inputs": {
       "message": "请审查这份合同，重点关注付款、违约和到期条款"
     },
     "files": {
-      "contract_files": ["<UPLOAD_ID>"]
-    },
-    "user_id": "client-user-001",
-    "conversation_id": "customer-session-001"
+      "files": ["<UPLOAD_ID>"]
+    }
   }'
 ```
 
-`inputs` 和 `files` 的键必须使用发布版本中的英文变量名。首次请求可省略 `user_id` 和 `conversation_id`；多轮应用在 `waiting_input` 后继续使用同一会话即可恢复。
+所有请求必须显式提供稳定的 `user_id`。首次运行省略 `conversation_id`，后续使用服务端返回的会话 ID。输入键必须匹配发布契约，文件通常绑定到 `files` 字段。
+
+默认 `response_mode: "blocking"` 等待本轮完成、追问或审批暂停后返回完整 JSON；`streaming` 在同一个 POST 中直接返回 SSE（curl 使用 `-N`）；`async` 立即返回排队任务和 `events_url`。等待默认上限 120 秒，可用 `wait_timeout_seconds` 设置为 1–300 秒；超时返回 `wait_timed_out: true`、`status_url` 和 `events_url`，后台继续执行。原先依赖立即排队响应的调用方应显式设置 `response_mode: "async"`。
+
+### 第二轮及后续请求
+
+`conversation_id` 放在 JSON 请求体**顶层**，与 `user_id`、`inputs` 同级，不放在 `inputs` 中，也不是 URL 参数。它来自上一轮响应，不能用运行 `id` 替代。
+
+```bash
+curl -X POST "http://localhost:18112/api/v1/apps/<PUBLIC_TOKEN>/runs" \
+  -H "Authorization: Bearer xsk_<API_KEY>" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "user_id": "client-user-001",
+    "conversation_id": "<上一轮返回的CONVERSATION_ID>",
+    "response_mode": "blocking",
+    "inputs": {"message": "请重点审查付款计划和违约责任。"},
+    "files": {"files": []}
+  }'
+```
+
+状态为 `waiting_input` 时，`output` 与 `waiting_input.question` 是智能体追问。第三轮及之后仍携带相同用户和会话 ID；没有新附件时数组留空，已有附件继续保留。流式调用从 `run.accepted` 或结束/暂停帧的 `result` 获取会话 ID。
 
 | 方法 | 路径 | 用途 |
 | --- | --- | --- |
-| `GET` | `/api/v1/apps/{token}` | 公开应用描述和输入契约 |
 | `POST` | `/api/v1/apps/{token}/files` | 上传临时文件 |
 | `POST` | `/api/v1/apps/{token}/runs` | 创建运行 |
 | `GET` | `/api/v1/apps/{token}/runs/{run_id}` | 查询状态、节点输出和文件 |
@@ -235,6 +269,14 @@ curl -X POST "http://localhost:18112/api/v1/apps/<PUBLIC_TOKEN>/runs" \
 完整接口见 [`docs/API.md`](docs/API.md)。
 
 ## 资源与执行安全
+
+执行器资源上限可通过 `.env` 配置：`EXECUTOR_MEMORY_LIMIT`（默认 `1g`，整个容器共享）、`EXECUTOR_CPU_LIMIT`（默认 `1.0`）、`EXECUTOR_PIDS_LIMIT`（默认 `128`）和 `CODE_TIMEOUT_SECONDS`（默认 `60` 秒）。修改容器资源上限后需要重建 executor：
+
+```bash
+docker compose up -d --no-deps --force-recreate executor
+```
+
+Executor 已包含 Fontconfig（`fc-list`）用于字体检查，但不预装受版权限制的商业字体。
 
 - 应用、Agent、Task、输入、运行、模型和资源均归属于工作空间。
 - 模型 API Key、HTTP/MCP token 和 headers 加密保存；管理 API 不返回密钥原文。
@@ -265,6 +307,7 @@ xuanshu_platform/
 ├── worker/                 # 应用 Worker 和 Studio Worker
 ├── executor/               # 独立隔离执行服务
 ├── frontend/src/           # Vue 3 + Pinia + Vue Router
+├── alembic/                # 数据库版本迁移
 ├── docs/API.md             # 公开 API 参考
 ├── docs/screenshots/       # README 界面截图
 ├── data/                   # Docker 持久化数据（不提交实际内容）
@@ -275,7 +318,16 @@ xuanshu_platform/
 
 ## 部署检查
 
-项目发布包不包含测试代码和本地开发缓存。部署后可用以下命令确认服务状态：
+Python 依赖由 `uv` 管理，支持 Python 3.10–3.13；前端开发需要 Node.js 22 或更高版本。
+
+```bash
+uv sync --no-dev
+cd frontend
+npm ci
+npm run build
+```
+
+部署后可用以下命令确认服务状态：
 
 ```bash
 curl http://localhost:18112/api/health
@@ -315,10 +367,13 @@ docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d --no-build
 
 `schema-init` 负责初始化和迁移数据库结构；生产弱密钥会在初始化时被拒绝。修改 `.env` 后重启相关服务，不要删除数据卷来“解决”配置问题。
 
+生产启动时自动执行 Alembic `upgrade head`；单独迁移可运行 `uv run alembic upgrade head`。
+
 ## 相关文档
 
 - [`docs/API.md`](docs/API.md)：公开 API、会话、SSE、审批和文件下载。
 - [`docs/LEGACY_PARITY.md`](docs/LEGACY_PARITY.md)：功能迁移矩阵与运行语义。
+- [`docs/run-event-protocol.md`](docs/run-event-protocol.md)：SSE 游标、重试轮次、并行节点状态及前端协议处理。
 - [CrewAI 官方文档](https://docs.crewai.com/)：Agent、Task、Crew、Flow、Skill 和 Tool 参考。
 
 ## 许可证与部署提示

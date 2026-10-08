@@ -41,7 +41,9 @@ export async function request(path, options = {}) {
     const detail = Array.isArray(payload.detail)
       ? payload.detail.map(item => `${item.loc?.slice(1).join('.') || '字段'}：${item.msg}`).join('；')
       : payload.detail
-    throw new Error(detail || payload.message || `HTTP ${response.status}`)
+    const error = new Error(detail || payload.message || `HTTP ${response.status}`)
+    error.status = response.status
+    throw error
   }
   return payload
 }
@@ -92,11 +94,15 @@ export const api = {
   resetUserPassword: (id, password) => request(`/api/admin/users/${id}/reset-password`, { method: 'POST', body: JSON.stringify({ password }) }),
   deleteUser: (id) => request(`/api/admin/users/${id}`, { method: 'DELETE' }),
   overview: () => request(`/api/overview?workspace_id=${localStorage.getItem('xuanshu_workspace') || ''}`),
+  skills: () => request('/api/skills'),
+  plugins: () => request('/api/plugins'),
   studioChat: (body) => request('/api/studio/chat', { method: 'POST', body: JSON.stringify(body) }),
   studioJob: (id) => request(`/api/studio/jobs/${id}`),
+  retryStudioJob: (id) => request(`/api/studio/jobs/${id}/retry`, { method: 'POST' }),
   studioSessions: () => request('/api/studio/sessions'),
   createStudioSession: (kind = 'crew') => request('/api/studio/sessions', { method: 'POST', body: JSON.stringify({ kind }) }),
   studioSession: (id) => request(`/api/studio/sessions/${id}`),
+  studioSessionMessages: (id, limit = 30, before = 0) => request(`/api/studio/sessions/${id}/messages?limit=${limit}&before=${Math.max(0, Number(before) || 0)}`),
   updateStudioSession: (id, body) => request(`/api/studio/sessions/${id}`, { method: 'PATCH', body: JSON.stringify(body) }),
   deleteStudioSession: (id) => request(`/api/studio/sessions/${id}`, { method: 'DELETE' }),
   studioEvents: async (id, onEvent) => {
@@ -199,9 +205,11 @@ export const api = {
   deleteConversation: (id, conversationId) => request(`/api/workflows/${id}/conversations/${conversationId}`, { method: 'DELETE' }),
   runs: () => request('/api/runs'),
   run: (id) => request(`/api/runs/${id}`),
+  retryRun: (id) => request(`/api/runs/${id}/retry`, { method: 'POST' }),
   deleteRun: (id) => request(`/api/runs/${id}`, { method: 'DELETE' }),
   traces: () => request('/api/traces'),
   trace: (conversationId) => request(`/api/traces/${conversationId}`),
+  traceRunEvents: (conversationId, runId) => request(`/api/traces/${conversationId}/runs/${runId}/events`),
   deleteTrace: (conversationId) => request(`/api/traces/${conversationId}`, { method: 'DELETE' }),
   downloadRunFile: (file) => downloadAuthenticatedFile(file),
   runEvents: async (id, onEvent, signal, afterEvent = 0) => {

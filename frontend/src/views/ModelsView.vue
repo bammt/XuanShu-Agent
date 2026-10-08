@@ -47,6 +47,7 @@ const blank = () => ({
   base_url: "",
   api_key: "",
   model_type: "chat",
+  supports_vision: false,
   temperature: null,
   max_tokens: null,
   timeout: 120,
@@ -276,13 +277,13 @@ async function saveAndTest() {
   >
 
   <div v-if="modal" class="modal-backdrop" @click.self="modal = false">
-    <section class="modal large">
+    <section class="modal large model-connection-modal" role="dialog" aria-modal="true" aria-label="模型连接">
       <header class="modal-header">
         <div>
           <span class="eyebrow">LLM CONNECTION</span>
           <h2>{{ form.id ? "编辑模型连接" : "添加模型连接" }}</h2>
         </div>
-        <button class="icon-button" @click="modal = false">
+        <button class="icon-button" type="button" title="关闭" aria-label="关闭模型连接" @click="modal = false">
           <X :size="16" />
         </button>
       </header>
@@ -307,6 +308,10 @@ async function saveAndTest() {
               </option></select
             ><small>Embedding 模型仅用于知识库向量化和检索。</small>
           </div>
+          <label v-if="form.model_type === 'chat'" class="model-vision-setting full">
+            <span><strong>图片输入</strong><small>此模型支持图片理解时开启</small></span>
+            <input v-model="form.supports_vision" type="checkbox" class="toggle" />
+          </label>
           <div class="field">
             <label>Provider</label
             ><select

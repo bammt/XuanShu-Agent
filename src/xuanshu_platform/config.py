@@ -22,6 +22,7 @@ class Settings(BaseSettings):
     code_timeout_seconds: int = 60
     run_max_retries: int = 3
     run_retry_base_seconds: float = 1.5
+    run_timeout_seconds: int = 1800
     conversation_lock_seconds: int = 180
     conversation_history_token_budget: int = 6000
     conversation_summary_max_chars: int = 4000

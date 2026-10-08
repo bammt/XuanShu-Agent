@@ -1,4 +1,4 @@
-import base64, hashlib, io, json, os, re, shutil, uuid
+import base64, hashlib, io, json, mimetypes, os, re, shutil, uuid
 from pathlib import Path, PurePosixPath
 from minio import Minio
 from minio.deleteobjects import DeleteObject
@@ -17,6 +17,7 @@ WORK_ROOT = Path('/var/lib/xuanshu/workspaces')
 INTERNAL_APP_DIRS = {'memory', '.xuanshu'}
 APP_KINDS = {'crew', 'flow'}
 BUILTIN_RESOURCES_ROOT = Path(__file__).with_name('builtin_resources')
+
 
 
 def application_internal_dir(app_root: Path) -> Path:
@@ -496,7 +497,8 @@ def sync_app_file(workspace_id: int, app_id: int, relative_name: str, data: byte
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_bytes(data)
     key = app_object_key(workspace_id, app_id, relative.as_posix(), app_kind)
-    minio.put_object(settings.minio_bucket, key, io.BytesIO(data), len(data))
+    minio.put_object(settings.minio_bucket, key, io.BytesIO(data), len(data),
+                content_type=mimetypes.guess_type(relative.as_posix())[0] or 'application/octet-stream')
     return target
 def sync_existing_app_file(workspace_id: int, app_id: int, relative_name: str, app_kind: str = 'crew') -> None:
     root = app_dir(workspace_id, app_id, app_kind)
@@ -506,7 +508,8 @@ def sync_existing_app_file(workspace_id: int, app_id: int, relative_name: str, a
         raise FileNotFoundError(relative.as_posix())
     size = source.stat().st_size
     with source.open('rb') as stream:
-        minio.put_object(settings.minio_bucket, app_object_key(workspace_id, app_id, relative.as_posix(), app_kind), stream, size)
+        minio.put_object(settings.minio_bucket, app_object_key(workspace_id, app_id, relative.as_posix(), app_kind), stream, size,
+                    content_type=mimetypes.guess_type(relative.as_posix())[0] or 'application/octet-stream')
 def delete_app_file(workspace_id: int, app_id: int, relative_name: str, app_kind: str = 'crew') -> None:
     root = app_dir(workspace_id, app_id, app_kind)
     target = resolve_app_file(root, relative_name)
@@ -527,7 +530,8 @@ def sync_session_file(workspace_id: int, app_id: int, execution_scope: str,
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_bytes(data)
     key = app_session_object_key(workspace_id, app_id, execution_scope, relative.as_posix(), app_kind)
-    minio.put_object(settings.minio_bucket, key, io.BytesIO(data), len(data))
+    minio.put_object(settings.minio_bucket, key, io.BytesIO(data), len(data),
+                content_type=mimetypes.guess_type(relative.as_posix())[0] or 'application/octet-stream')
     return target
 
 
@@ -541,7 +545,8 @@ def sync_existing_session_file(workspace_id: int, app_id: int, execution_scope: 
     size = source.stat().st_size
     key = app_session_object_key(workspace_id, app_id, execution_scope, relative.as_posix(), app_kind)
     with source.open('rb') as stream:
-        minio.put_object(settings.minio_bucket, key, stream, size)
+        minio.put_object(settings.minio_bucket, key, stream, size,
+                    content_type=mimetypes.guess_type(relative.as_posix())[0] or 'application/octet-stream')
 
 
 def delete_session_file(workspace_id: int, app_id: int, execution_scope: str,

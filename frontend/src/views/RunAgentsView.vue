@@ -25,7 +25,7 @@ onMounted(() => store.load());
   </div>
   <div class="toolbar">
     <label class="search-input"><Search :size="15" /><input v-model="search" placeholder="搜索已发布智能体" /></label>
-    <span style="font-size: 10px; color: var(--subtle)">{{ published.length }} 个可运行智能体</span>
+    <span style="font-size: 13px; color: var(--subtle)">{{ published.length }} 个可运行智能体</span>
   </div>
   <section v-if="published.length" class="automation-grid">
     <article v-for="item in published" :key="item.id" class="automation-card run-agent-card">
@@ -40,7 +40,7 @@ onMounted(() => store.load());
       </div>
       <div class="automation-stats">
         <span><strong>{{ item.tasks?.length || 0 }}</strong> 节点</span>
-        <span><strong>{{ item.agents?.length || 0 }}</strong> Agent</span>
+        <span><strong>{{ item.agents?.length || 0 }}</strong> 智能体</span>
         <span><strong>{{ item.inputs?.length || 0 }}</strong> 输入</span>
       </div>
       <footer>

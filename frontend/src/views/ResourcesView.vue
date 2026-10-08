@@ -5,6 +5,11 @@ import { AppWindow, BookOpen, Braces, Code2, FolderUp, Globe2, Network, Plus, Se
 import { api } from '../services/api'
 import { usePlatformStore } from '../stores/platform'
 import EmptyState from '../components/EmptyState.vue'
+import ToolInputEditor from '../components/ToolInputEditor.vue'
+import HttpRequestEditor from '../components/HttpRequestEditor.vue'
+import RequestKeyValues from '../components/RequestKeyValues.vue'
+import VariableTextarea from '../components/VariableTextarea.vue'
+import CodeEditor from '../components/CodeEditor.vue'
 import { confirmDialog } from '../services/dialog'
 
 const store = usePlatformStore()
@@ -26,8 +31,9 @@ const pythonTemplate = `def run(query: str = "", **kwargs):
     """Return the tool result. Code runs inside the isolated executor."""
     return f"Processed: {query}"
 `
-const newPlugin = () => ({ name: '', description: '', kind: 'http', version: '0.1.0', module: '', class_name: 'CustomTool', package: '', source_code: pythonTemplate, source_path: '', input_schema: {}, env_vars: [], permissions: [], endpoint: '', method: 'POST', request_template: {}, response_path: '', server_url: '', command: '', args: [], headers: {}, auth_header: 'Authorization', auth_token: '', app_slug: '', cache_tools_list: true, enabled: true })
+const newPlugin = () => ({ name: '', description: '', kind: 'http', version: '0.1.0', module: '', class_name: 'CustomTool', package: '', source_code: pythonTemplate, source_path: '', input_schema: {}, env_vars: [], permissions: [], endpoint: '', method: 'POST', request_template: {version:2,params:{},body_type:'none',body:{},verify_ssl:true,timeout:30}, response_path: '', server_url: '', command: '', args: [], headers: {}, auth_header: 'Authorization', auth_token: '', app_slug: '', cache_tools_list: true, enabled: true })
 const plugin = ref(newPlugin())
+const httpVariables = computed(() => Object.entries(plugin.value.input_schema?.properties || {}).map(([name,field])=>({name,label:field.description || ''})))
 const headersText = ref('{}')
 const schemaText = ref('{}')
 const argsText = ref('')
@@ -42,13 +48,12 @@ const actionChoices = [
   { id: 'http', label: 'HTTP API', detail: 'Call an API endpoint', icon: Globe2 },
   { id: 'python', label: 'Python tool', detail: 'Load an installed Python class', icon: Code2 },
   { id: 'mcp', label: 'MCP server', detail: 'Connect to one MCP server', icon: Network },
-  { id: 'app', label: 'Connected app', detail: 'Authorized by CrewAI platform token', icon: AppWindow, disabled: computed(() => !store.runtime?.connected_apps?.configured) },
+  { id: 'app', label: 'Connected app', detail: '连接外部应用并授权使用', icon: AppWindow, disabled: computed(() => !store.runtime?.connected_apps?.configured) },
 ]
 function iconFor(kind) { return kind === 'python' ? Code2 : kind === 'app' ? AppWindow : kind.startsWith('mcp_') ? Network : Globe2 }
 function choiceDisabled(choice) { return Boolean(choice.disabled?.value) }
 function chooseAction(type) {
   const choice = actionChoices.find(item => item.id === type)
-  if (choiceDisabled(choice)) { store.error = '服务端尚未配置 CREWAI_PLATFORM_INTEGRATION_TOKEN'; return }
   actionType.value = type; plugin.value.kind = type === 'mcp' ? mcpTransport.value : type
 }
 function openPlugin() { plugin.value = newPlugin(); actionType.value = 'http'; pythonMode.value = 'source'; mcpTransport.value = 'mcp_http'; headersText.value = '{}'; schemaText.value = '{}'; requestText.value = '{}'; argsText.value = ''; envText.value = ''; permissionText.value = ''; modal.value = true }
@@ -64,7 +69,13 @@ function editPlugin(item) {
 function changeTransport(value) { mcpTransport.value = value; plugin.value.kind = value }
 async function savePlugin() {
   try {
-    plugin.value.headers = JSON.parse(headersText.value || '{}'); plugin.value.input_schema = JSON.parse(schemaText.value || '{}'); plugin.value.request_template = JSON.parse(requestText.value || '{}')
+    if (actionType.value !== 'http') plugin.value.headers = JSON.parse(headersText.value || '{}');
+    if (actionType.value !== 'http') plugin.value.input_schema = JSON.parse(schemaText.value || '{}');
+    if (actionType.value !== 'http') plugin.value.request_template = JSON.parse(requestText.value || '{}')
+    const template = plugin.value.request_template
+    if (template.version === 2 && template.body_is_text && ['json','form'].includes(template.body_type)) {
+      plugin.value.request_template = {...template,body:JSON.parse(template.body),body_is_text:false}
+    }
     plugin.value.args = argsText.value.split('\n').map(item => item.trim()).filter(Boolean); plugin.value.env_vars = envText.value.split(/[\n,]/).map(item => item.trim()).filter(Boolean); plugin.value.permissions = permissionText.value.split(/[\n,]/).map(item => item.trim()).filter(Boolean)
     if (actionType.value === 'python') {
       if (pythonMode.value === 'source') plugin.value.module = ''
@@ -104,14 +115,17 @@ async function dropFolder(event) {
 async function importFolder() { if (!importFiles.value.length || importing.value) return; importing.value = true; importProgress.value=0; try { await api.importSkills(importFiles.value,value=>{importProgress.value=value}); await store.load(); importModal.value = false; importFiles.value = []; store.notify('Skill package 已检查并导入') } catch (error) { importFiles.value = []; importProgress.value = 0; store.error = `${error.message}，请重新选择文件夹` } finally { importing.value = false } }
 function formatSize(value) { return value < 1024 * 1024 ? `${Math.ceil(value / 1024)} KB` : `${(value / 1024 / 1024).toFixed(1)} MB` }
 onMounted(async () => {
-  if (!store.skills.length && !store.plugins.length) await store.load()
+  if (!store.skills.length && !store.plugins.length) {
+    await store.load()
+    await store.loadResources()
+  }
   if (route.query.tab === 'actions') tab.value = 'actions'
   if (route.query.create === '1' && tab.value === 'actions') openPlugin()
 })
 </script>
 
 <template>
-  <div class="page-heading"><div><h2>Agent capabilities</h2><p>Skills 提供按需加载的知识与流程；Tools 让 Agent 调用代码、API、MCP 或外部应用。</p></div><div class="heading-actions"><template v-if="tab==='skills'"><button class="button" @click="importModal=true"><FolderUp :size="14" />导入 Skill 文件夹</button><button class="button primary" @click="router.push('/skill-dev')"><Code2 :size="14" />创建 Skill</button></template><button v-else class="button primary" @click="openPlugin"><Plus :size="15" />添加工具</button><input ref="folderInput" type="file" hidden webkitdirectory directory multiple @change="stageFolder" /></div></div>
+  <div class="page-heading"><div><h2>智能体能力</h2><p>Skill 提供可复用的知识与流程，工具让智能体连接代码、API、MCP 或外部应用。</p></div><div class="heading-actions"><template v-if="tab==='skills'"><button class="button" @click="importModal=true"><FolderUp :size="14" />导入 Skill 文件夹</button><button class="button primary" @click="router.push('/skill-dev')"><Code2 :size="14" />创建 Skill</button></template><button v-else class="button primary" @click="openPlugin"><Plus :size="15" />添加工具</button><input ref="folderInput" type="file" hidden webkitdirectory directory multiple @change="stageFolder" /></div></div>
   <div class="toolbar"><div class="toolbar-left"><div class="segmented"><button :class="{active:tab==='skills'}" @click="tab='skills'">Skills</button><button :class="{active:tab==='actions'}" @click="tab='actions'">Tools</button></div><label class="search-input"><Search :size="14" /><input v-model="search" placeholder="搜索 Skill 或工具" /></label></div><span class="resource-count">{{ items.length }} items</span></div>
 
   <section v-if="items.length" class="resource-grid"><article v-for="item in items" :key="item.id" class="resource-card is-editable" @click="tab==='skills'?router.push(`/skill-dev/${item.id}`):editPlugin(item)"><div class="resource-card-top"><span class="resource-icon"><BookOpen v-if="tab==='skills'" :size="17" /><component v-else :is="iconFor(item.kind)" :size="17" /></span><div class="card-actions"><button class="icon-button" title="编辑" @click.stop="tab==='skills'?router.push(`/skill-dev/${item.id}`):editPlugin(item)"><SquarePen :size="14" /></button><button class="icon-button" title="删除" @click.stop="remove(item)"><Trash2 :size="14" /></button></div></div><h3>{{ item.name }}</h3><p>{{ item.description }}</p><div class="resource-meta"><span class="tag">{{ tab==='skills'?(item.source==='registry'?item.registry_ref:item.slug):kindLabels[item.kind] }}</span><span v-if="tab==='actions'&&item.kind.startsWith('mcp_')" class="tag">{{ transportLabels[item.kind] }}</span><span class="tag">{{ item.enabled?'Enabled':'Disabled' }}</span></div></article></section>
@@ -120,12 +134,12 @@ onMounted(async () => {
   <div v-if="importModal" class="modal-backdrop" @click.self="!importing&&(importModal=false)"><section class="modal"><header class="modal-header"><div><span class="eyebrow">IMPORT SKILL</span><h2>导入 Skill 文件夹</h2></div><button class="icon-button" :disabled="importing" @click="importModal=false"><X :size="16"/></button></header><div class="modal-body skill-import-body"><button class="skill-dropzone" :disabled="importing" @click="folderInput?.click()" @dragover.prevent @drop.prevent="dropFolder"><FolderUp :size="24"/><strong>选择或拖入 Skill 文件夹</strong><small>必须包含一个带 YAML front matter 的 SKILL.md；所有路径和文件大小会在服务端再次检查。</small></button><div v-if="importFiles.length" class="import-summary"><strong>{{ importFiles.length }} 个文件 · {{ formatSize(importFiles.reduce((sum,file)=>sum+file.size,0)) }}</strong><div><span v-for="file in importFiles.slice(0,6)" :key="file.webkitRelativePath||file.name">{{ file.webkitRelativePath||file.name }}</span><small v-if="importFiles.length>6">还有 {{ importFiles.length-6 }} 个文件</small></div></div><div v-if="importing" class="upload-status"><div class="upload-status-head"><span>正在上传并校验 Skill package</span><b>{{ importProgress }}%</b></div><div class="upload-progress-track"><i :style="{width:`${importProgress}%`}"></i></div></div></div><footer class="modal-footer"><button class="button" :disabled="importing" @click="importModal=false">取消</button><button class="button primary" :disabled="!importFiles.length||importing" @click="importFolder">{{ importing?(importProgress<100?'上传中...':'校验中...'):'检查并导入' }}</button></footer></section></div>
 
   <div v-if="modal" class="modal-backdrop" @click.self="modal=false"><section class="modal large"><header class="modal-header"><div><span class="eyebrow">AGENT TOOL</span><h2>{{ plugin.id ? '编辑' : '添加' }} Agent 可调用的工具</h2></div><button class="icon-button" @click="modal=false"><X :size="16" /></button></header><div class="modal-body">
-    <div class="action-type-grid"><button v-for="choice in actionChoices" :key="choice.id" :class="{active:actionType===choice.id}" :disabled="choiceDisabled(choice)" @click="chooseAction(choice.id)"><component :is="choice.icon" :size="17" /><span><strong>{{ choice.label }}</strong><small>{{ choiceDisabled(choice)?'需先配置平台集成令牌':choice.detail }}</small></span></button></div>
+    <div class="action-type-grid"><button v-for="choice in actionChoices" :key="choice.id" :class="{active:actionType===choice.id}" @click="chooseAction(choice.id)"><component :is="choice.icon" :size="17" /><span><strong>{{ choice.label }}</strong><small>{{ choiceDisabled(choice)?'需先配置平台集成令牌':choice.detail }}</small></span></button></div>
     <div class="form-grid action-form"><div class="field full"><label>Name</label><input v-model="plugin.name" /></div><div class="field full"><label>Description</label><textarea v-model="plugin.description" placeholder="说明 Agent 何时调用、能完成什么以及限制。"></textarea></div>
-      <template v-if="actionType==='python'"><div class="field full"><label>执行方式</label><div class="segmented transport-switch"><button class="active">隔离源码</button></div></div><div class="field full"><label>Python source</label><textarea v-model="plugin.source_code" class="python-source"></textarea><small>必须定义 run(**kwargs) 或 main(**kwargs)。源码只在统一 executor 容器及当前应用工作目录中执行，不会加载进 Worker。</small></div><div class="field full"><label>Input schema (JSON Schema)</label><textarea v-model="schemaText"></textarea></div></template>
-      <template v-if="actionType==='http'"><div class="field full"><label>Endpoint</label><input v-model="plugin.endpoint" placeholder="https://api.example.com/search/{query}" /></div><div class="field"><label>Method</label><select v-model="plugin.method"><option>GET</option><option>POST</option><option>PUT</option><option>PATCH</option><option>DELETE</option></select></div><div class="field"><label>Response path</label><input v-model="plugin.response_path" placeholder="data.items" /></div><div class="field full"><label>Request template (JSON)</label><textarea v-model="requestText"></textarea></div><div class="field full"><label>Input schema (JSON Schema)</label><textarea v-model="schemaText"></textarea></div></template>
+      <template v-if="actionType==='python'"><div class="field full"><label>执行方式</label><div class="segmented transport-switch"><button class="active">隔离源码</button></div></div><div class="field full"><label>Python source</label><CodeEditor v-model="plugin.source_code" language="python" min-height="260px" /><small>必须定义 run(**kwargs) 或 main(**kwargs)。源码只在统一 executor 容器及当前应用工作目录中执行，不会加载进 Worker。</small></div><div class="field full"><label>Input schema (JSON Schema)</label><CodeEditor v-model="schemaText" language="json" min-height="150px" /></div></template>
+      <template v-if="actionType==='http'"><div class="field full"><label>Endpoint</label><VariableTextarea v-model="plugin.endpoint" :variables="httpVariables" /></div><div class="field"><label>Method</label><select v-model="plugin.method"><option>GET</option><option>POST</option><option>PUT</option><option>PATCH</option><option>DELETE</option></select></div><div class="field"><label>Response path</label><input v-model="plugin.response_path" placeholder="data.items" /></div><div class="field full"><HttpRequestEditor v-model="plugin.request_template" :variables="httpVariables" /><small class="form-help">Request template 只定义请求如何发送（参数、正文、超时和重试）；Input schema 只定义 Agent 可以传入的变量，两者职责不同。</small></div><div class="field full"><RequestKeyValues v-model="plugin.headers" :variables="httpVariables" label="请求头" /><small v-if="plugin.has_headers">已保存的请求头已隐藏；留空对象可保留。</small></div><div class="field full"><ToolInputEditor v-model="plugin.input_schema" /></div></template>
       <template v-if="actionType==='mcp'"><div class="field full"><label>Connection</label><div class="segmented transport-switch"><button v-for="(label,key) in transportLabels" :key="key" :class="{active:mcpTransport===key}" @click="changeTransport(key)">{{ label }}</button></div></div><div class="field full"><label>Server URL</label><input v-model="plugin.server_url" placeholder="https://mcp.example.com/mcp" /></div><div class="field"><label>Auth header</label><input v-model="plugin.auth_header" /></div><div class="field"><label>Token</label><input v-model="plugin.auth_token" type="password" /></div><div class="field full"><label>Additional headers (JSON)</label><textarea v-model="headersText"></textarea></div><div class="field full"><small>为保持统一沙箱边界，仅支持远程 Streamable HTTP / SSE；本地 stdio 命令不会在 Worker 中执行。</small></div></template>
-      <template v-if="actionType==='app'"><div class="field full"><label>App name</label><input v-model="plugin.app_slug" placeholder="gmail" /><small>填写 CrewAI 支持且已授权的应用名，例如 gmail、slack、github。服务环境必须配置 CREWAI_PLATFORM_INTEGRATION_TOKEN。</small></div></template>
+      <template v-if="actionType==='app'"><p v-if="!store.runtime?.connected_apps?.configured" class="field full">连接服务尚未启用。请在服务端配置 CREWAI_PLATFORM_INTEGRATION_TOKEN，并在 CrewAI 平台完成应用授权；配置后重新启动 backend 和 worker，再保存工具配置。</p><div class="field full"><label>App name</label><input v-model="plugin.app_slug" placeholder="gmail" /><small>填写 CrewAI 支持且已授权的应用名，例如 gmail、slack、github。服务环境必须配置 CREWAI_PLATFORM_INTEGRATION_TOKEN。</small></div></template>
       <div v-if="actionType==='python'" class="field full"><label>Required environment variables</label><textarea v-model="envText" placeholder="API_KEY, DATABASE_URL"></textarea><small>只允许将这里声明且服务端已配置的变量传给该工具的隔离进程；普通代码执行无法读取。</small></div><div class="field full"><label>Permissions / scopes</label><textarea v-model="permissionText"></textarea></div><label v-if="actionType==='mcp'" class="toggle-row"><span>Cache server tool list</span><input v-model="plugin.cache_tools_list" class="toggle" type="checkbox" /></label><label class="toggle-row"><span>Enabled</span><input v-model="plugin.enabled" class="toggle" type="checkbox" /></label>
     </div></div><footer class="modal-footer"><button class="button" @click="modal=false">取消</button><button class="button primary" :disabled="!plugin.name||!plugin.description" @click="savePlugin">保存工具</button></footer></section></div>
 </template>

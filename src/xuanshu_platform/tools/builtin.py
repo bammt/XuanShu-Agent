@@ -3,19 +3,22 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 import hashlib
 import json
+import mimetypes
 import os
 import re
+from collections.abc import Mapping
 from typing import Any, ClassVar, Literal
 import httpx
 from crewai.tools import BaseTool
 from crewai.mcp import MCPServerHTTP, MCPServerSSE
 from crewai.mcp.tool_resolver import MCPToolResolver
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, create_model
 from docx import Document
 from openpyxl import load_workbook
 from openpyxl.utils import get_column_letter
 from pypdf import PdfReader
 from ..config import settings
+from ..http_requests import build_http_request, send_http_request
 
 _runtime_idempotency_key: ContextVar[str] = ContextVar('xuanshu_runtime_idempotency_key', default='')
 _runtime_tool_invocations: ContextVar[dict[str, int] | None] = ContextVar(
@@ -95,6 +98,19 @@ class SkillCommandInput(BaseModel):
 class DynamicToolInput(BaseModel):
     arguments: dict[str, Any] = Field(default_factory=dict, description='按工具说明提供的参数对象')
 
+def input_model_from_schema(schema: dict | None) -> type[BaseModel]:
+    """Keep the callable's arguments envelope and expose its full JSON Schema."""
+    if not schema:
+        return DynamicToolInput
+    return create_model(
+        'ConfiguredToolInput',
+        arguments=(dict[str, Any], Field(
+            default_factory=dict,
+            description='工具输入参数',
+            json_schema_extra=schema,
+        )),
+    )
+
 
 class ExecutionReceiptStore:
     def __init__(self) -> None:
@@ -152,8 +168,8 @@ class AskUserInput(BaseModel):
         description=('可选；只能填写当前应用已声明运行输入的机器字段名，不能填写 text、file、image 等类型；'
                      '通用业务追问必须留空'),
     )
-    input_type: Literal['text', 'long_text', 'file', 'image', 'number', 'boolean', 'json'] | None = Field(
-        default=None, description='可省略；这里才填写 text、file、image 等字段类型，且必须与 input_name 的声明一致'
+    input_type: Literal['text', 'long_text', 'file'] | None = Field(
+        default=None, description='可省略；只支持文本或文件输入。数字、布尔值和结构化内容请让用户用文字输入，再由模型转换'
     )
     required: bool = Field(default=True, description='该信息是否必须提供')
 
@@ -177,6 +193,9 @@ class AskUserTool(BaseTool):
     GENERIC_INPUT_NAMES: ClassVar[frozenset[str]] = frozenset({
         'text', 'message', 'user_message', 'chat_message', 'input', 'user_input',
     })
+    TEXT_INPUT_TYPES: ClassVar[frozenset[str]] = frozenset({'text', 'long_text'})
+    FILE_INPUT_TYPES: ClassVar[frozenset[str]] = frozenset({'file', 'image'})
+    GENERIC_REPLY_NAME: ClassVar[str] = '__ask_user_reply'
 
     def _run(self, question: str, input_name: str = '', input_type: str | None = None,
              required: bool = True) -> str:
@@ -186,7 +205,17 @@ class AskUserTool(BaseTool):
             'input_type': input_type,
             'required': bool(required),
         }
-        question = str(question or '').strip()
+        # Some OpenAI-compatible providers return escaped control characters
+        # as literal text inside tool arguments. Normalize them at the
+        # boundary so the waiting-input card receives real line breaks.
+        question = (
+            str(question or '')
+            .replace('\\r\\n', '\n')
+            .replace('\\n', '\n')
+            .replace('\\r', '\r')
+            .replace('\\t', '\t')
+            .strip()
+        )
         if not question:
             message = '无法向用户提问：question 不能为空。'
             self.request_store.set_error(message, tool_name=self.name, arguments=arguments)
@@ -203,25 +232,25 @@ class AskUserTool(BaseTool):
             self.request_store.set_error(message, tool_name=self.name, arguments=arguments)
             return message
         requested_type = str(input_type or '').strip()
-        normalized_type = str((contract or {}).get('input_type') or requested_type or 'text').strip()
-        if contract and requested_type and requested_type != contract.get('input_type'):
-            # ``text`` is the generic chat value used by some compatible
-            # models; it is valid for a long_text field because the platform
-            # still stores the complete user message under that field.
-            if requested_type == 'text' and contract.get('input_type') == 'long_text':
-                requested_type = str(contract.get('input_type'))
-            else:
-                message = (f'无法向用户提问：字段 {input_name} 的类型必须是 '
-                           f"{contract.get('input_type')}，不能是 {requested_type}。")
-                self.request_store.set_error(message, tool_name=self.name, arguments=arguments)
-                return message
+        contract_type = str((contract or {}).get('input_type') or '').strip()
+        # User-facing ask_user supports natural text and file collection only.
+        # Number/boolean/JSON contracts remain text prompts and are interpreted
+        # by the downstream Agent/LLM instead of forcing an unnatural widget.
+        if contract_type in self.FILE_INPUT_TYPES:
+            normalized_type = 'file'
+        else:
+            normalized_type = 'text'
+        if requested_type in self.FILE_INPUT_TYPES and contract_type not in self.FILE_INPUT_TYPES:
+            message = (f'无法向用户提问：字段 {input_name} 是文本输入，不能按文件提问。')
+            self.request_store.set_error(message, tool_name=self.name, arguments=arguments)
+            return message
         file_inputs = [
             name for name, item in self.allowed_inputs.items()
             if str(item.get('input_type') or '') in {'file', 'image'}
         ]
         self.request_store.set({
             'question': question,
-            'input_name': input_name,
+            'input_name': input_name or self.GENERIC_REPLY_NAME,
             'input_type': normalized_type,
             'required': bool((contract or {}).get('required', required)),
             'accepts_files': bool(file_inputs),
@@ -493,24 +522,64 @@ class ConfiguredHttpTool(BaseTool):
     headers: dict[str, str] = Field(default_factory=dict)
     request_template: dict = Field(default_factory=dict)
     response_path: str = ''
+    input_schema: dict = Field(default_factory=dict)
+    workspace_id: int = Field(default=0, exclude=True)
+    app_id: int = Field(default=0, exclude=True)
+    execution_scope: str = Field(default='legacy', exclude=True)
+    app_kind: str = Field(default='crew', exclude=True)
+
+    def _materialize_file_inputs(self, values: dict[str, Any]) -> dict[str, Any]:
+        """Resolve schema-declared binary inputs from the session workspace."""
+        properties = self.input_schema.get('properties') if isinstance(self.input_schema, dict) else {}
+        if not isinstance(properties, dict):
+            return values
+        root = app_session_dir(
+            self.workspace_id, self.app_id, self.execution_scope, self.app_kind,
+        ).resolve()
+        for name, schema in properties.items():
+            if not isinstance(schema, dict) or schema.get('format') != 'binary':
+                continue
+            if name not in values or values[name] in (None, ''):
+                continue
+            raw = values[name]
+            items = raw if isinstance(raw, list) else [raw]
+            materialized = []
+            for item in items:
+                if isinstance(item, Mapping) and 'data' in item:
+                    materialized.append(dict(item))
+                    continue
+                if not isinstance(item, str):
+                    materialized.append(item)
+                    continue
+                try:
+                    path = resolve_app_file(root, item)
+                except (ValueError, OSError) as exc:
+                    raise ValueError(f'文件输入路径无效：{item}') from exc
+                if not path.is_file():
+                    raise ValueError(f'文件输入不存在：{item}')
+                materialized.append({
+                    'name': path.name,
+                    'content_type': mimetypes.guess_type(path.name)[0] or 'application/octet-stream',
+                    'data': path.read_bytes(),
+                })
+            values[name] = materialized if isinstance(raw, list) else materialized[0]
+        return values
 
     def _run(self, arguments: dict[str, Any] | None = None) -> str:
-        values = arguments or {}
+        values = dict(arguments or {})
         try:
-            endpoint = self.endpoint.format(**values)
-            payload = {**self.request_template, **values}
+            if self.input_schema:
+                from jsonschema import validate
+                validate(values, self.input_schema)
+            values = self._materialize_file_inputs(values)
             method = self.method.upper()
-            headers = dict(self.headers)
-            if current_idempotency_key() and 'Idempotency-Key' not in headers:
-                headers['Idempotency-Key'] = tool_idempotency_key('http.request', {
-                    'method': method,
-                    'endpoint': endpoint,
-                    'payload': payload,
+            endpoint, kwargs = build_http_request(self.endpoint, method, self.headers, self.request_template, values)
+            if current_idempotency_key() and 'Idempotency-Key' not in kwargs['headers']:
+                kwargs['headers']['Idempotency-Key'] = tool_idempotency_key('http.request', {
+                    'method': method, 'endpoint': endpoint,
+                    'arguments': values, 'template': self.request_template,
                 })
-            kwargs = {'headers': headers, 'timeout': 30.0}
-            if method == 'GET': kwargs['params'] = payload
-            else: kwargs['json'] = payload
-            response = httpx.request(method, endpoint, **kwargs)
+            response = send_http_request(method, endpoint, kwargs, self.request_template)
             response.raise_for_status()
             data: Any = response.json() if 'json' in response.headers.get('content-type', '') else response.text
             for part in filter(None, self.response_path.split('.')):
@@ -530,6 +599,22 @@ class ConfiguredPythonTool(BaseTool):
     source_code: str
     environment: dict[str, str] = Field(default_factory=dict, exclude=True)
     skill_roots: list[str] = Field(default_factory=list, exclude=True)
+
+    receipt_store: Any = Field(default=None, exclude=True)
+
+    def execute_structured(self, arguments: dict[str, Any]) -> dict:
+        from ..node_execution import code_program, parse_code_result
+        source = self.source_code + '\nif "run" in globals():\n    main = run\n'
+        executor = SandboxedPythonTool(
+            workspace_id=self.workspace_id, app_id=self.app_id,
+            execution_scope=self.execution_scope, app_kind=self.app_kind,
+            environment=self.environment, skill_roots=self.skill_roots,
+            receipt_store=self.receipt_store,
+        )
+        result = executor.execute(code_program(source, arguments))
+        if result.get('exit_code') != 0:
+            raise RuntimeError(result.get('stderr') or 'Python 工具执行失败')
+        return parse_code_result(result.get('stdout') or '')
 
     def _run(self, arguments: dict[str, Any] | None = None) -> str:
         invocation = (self.source_code + '\n\n'
@@ -567,13 +652,15 @@ def configured_capabilities(
         common = {'name': function_name[:64],
                   'description': item.get('description') or item.get('name', '工作空间工具')}
         if item.get('kind') == 'http' and item.get('endpoint'):
-            tools.append(ConfiguredHttpTool(**common, endpoint=item['endpoint'], method=item.get('method', 'POST'),
+            tools.append(ConfiguredHttpTool(**common, args_schema=input_model_from_schema(item.get('input_schema') or {}), endpoint=item['endpoint'], method=item.get('method', 'POST'),
                                             headers=item.get('headers') or {}, request_template=item.get('request_template') or {},
-                                            response_path=item.get('response_path', '')))
+                                            response_path=item.get('response_path', ''), input_schema=item.get('input_schema') or {},
+                                            workspace_id=workspace_id, app_id=app_id,
+                                            execution_scope=execution_scope, app_kind=app_kind))
         elif item.get('kind') == 'python' and item.get('source_code'):
             names = [str(name) for name in item.get('env_vars', [])]
             environment = {name: os.environ[name] for name in names if name in os.environ}
-            tools.append(ConfiguredPythonTool(**common, workspace_id=workspace_id, app_id=app_id, app_kind=app_kind,
+            tools.append(ConfiguredPythonTool(**common, args_schema=input_model_from_schema(item.get('input_schema') or {}), workspace_id=workspace_id, app_id=app_id, app_kind=app_kind,
                                               execution_scope=execution_scope,
                                               source_code=item['source_code'], environment=environment,
                                               skill_roots=skill_roots or [], receipt_store=receipt_store))

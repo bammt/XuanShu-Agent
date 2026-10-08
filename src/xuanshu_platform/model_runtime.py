@@ -78,7 +78,12 @@ def compatible_thinking_params(thinking_mode: str, effort: str) -> tuple[str, di
     return reasoning_effort, extra_body
 
 
-def profile_llm_kwargs(profile: dict | None, fallback_model: str | None = None) -> dict:
+def profile_llm_kwargs(
+    profile: dict | None,
+    fallback_model: str | None = None,
+    *,
+    stream: bool | None = None,
+) -> dict:
     profile = profile or {}
     model = profile.get('model') or fallback_model
     if not model:
@@ -90,6 +95,13 @@ def profile_llm_kwargs(profile: dict | None, fallback_model: str | None = None) 
         'timeout': profile.get('timeout', 180),
         'max_retries': profile.get('max_retries', 5),
     }
+    # Streaming is an execution concern.  Keep the provider profile backwards
+    # compatible, while allowing the runtime to explicitly request token
+    # deltas for a user-facing run.
+    if stream is None and profile.get('stream') is not None:
+        stream = bool(profile.get('stream'))
+    if stream is not None:
+        kwargs['stream'] = bool(stream)
     for key in ('temperature', 'max_tokens'):
         if profile.get(key) is not None:
             kwargs[key] = profile[key]
@@ -171,12 +183,25 @@ def profile_llm_kwargs(profile: dict | None, fallback_model: str | None = None) 
     return kwargs
 
 
-def profile_llm(profile: dict | None, fallback_model: str | None = None) -> LLM:
-    return LLM(**profile_llm_kwargs(profile, fallback_model))
+def profile_llm(
+    profile: dict | None,
+    fallback_model: str | None = None,
+    *,
+    stream: bool | None = None,
+) -> LLM:
+    return LLM(**profile_llm_kwargs(profile, fallback_model, stream=stream))
 
 
 def uses_prompt_structured_output(profile: dict | None) -> bool:
     return is_openai_compatible_profile(profile)
+
+
+def _response_format_unavailable(error: Exception) -> bool:
+    """Recognize gateways that reject CrewAI's native response_format mode."""
+    text = str(error or '').casefold()
+    return 'response_format' in text and any(
+        token in text for token in ('unavailable', 'unsupported', 'not support', 'invalid_request')
+    )
 
 
 def structured_messages(messages: list[dict], response_model: type[BaseModel]) -> list[dict]:
@@ -195,15 +220,49 @@ def structured_messages(messages: list[dict], response_model: type[BaseModel]) -
     return result
 
 
+def _empty_response_error(error: Exception) -> bool:
+    return 'None or empty' in str(error)
+
+
 def kickoff_structured(agent, messages: list[dict], response_model: type[BaseModel],
                        profile: dict | None, *, label: str = 'agent'):
+    """Run one structured call, retrying once if the provider returns nothing.
+
+    An empty completion is a transient provider failure, not a design error;
+    failing the whole Studio turn for it discards all earlier stage work.
+    """
+    try:
+        return _kickoff_structured_once(agent, messages, response_model, profile, label=label)
+    except Exception as error:
+        if not _empty_response_error(error):
+            raise
+        logging.warning('empty structured response; retrying once label=%s', label)
+        return _kickoff_structured_once(agent, messages, response_model, profile, label=f'{label}_retry')
+
+
+def _kickoff_structured_once(agent, messages: list[dict], response_model: type[BaseModel],
+                             profile: dict | None, *, label: str = 'agent'):
     started = time.perf_counter()
     if uses_prompt_structured_output(profile):
         prepared = structured_messages(messages, response_model)
         output = agent.kickoff(messages=prepared)
     else:
         prepared = messages
-        output = agent.kickoff(messages=messages, response_format=response_model)
+        try:
+            output = agent.kickoff(messages=messages, response_format=response_model)
+        except Exception as error:
+            # Some OpenAI-compatible gateways advertise the OpenAI provider
+            # shape but reject response_format at runtime. Retry this one
+            # structured call through the prompt-schema path so Composer can
+            # continue and validate the JSON locally.
+            if not _response_format_unavailable(error):
+                raise
+            prepared = structured_messages(messages, response_model)
+            logging.warning(
+                'structured response_format rejected; falling back to prompt schema label=%s error=%s',
+                label, error,
+            )
+            output = agent.kickoff(messages=prepared)
     _log_structured_call(label, prepared, response_model, started, getattr(output, 'usage_metrics', None))
     return output
 

@@ -1,4 +1,15 @@
 <script setup>
+import VariableTextarea from '../components/VariableTextarea.vue';
+import NodeInputBindings from '../components/NodeInputBindings.vue';
+import ConditionGroupEditor from '../components/ConditionGroupEditor.vue';
+import CodeEditor from '../components/CodeEditor.vue';
+import CrewSettingsEditor from '../components/CrewSettingsEditor.vue';
+import {
+  migrateDeterministicBindings,
+  removeDependencyBindings,
+  selectableNodeVariables,
+} from '../services/nodeBindings.js';
+import { isLatestRunMessage } from '../services/latestRun.js';
 import {
   computed,
   h,
@@ -37,11 +48,11 @@ import {
   LockKeyhole,
   Maximize2,
   MessageCircle,
-  MousePointer2,
   Pencil,
   Play,
   Plus,
   Route,
+  RotateCcw,
   Save,
   Send,
   Paperclip,
@@ -56,7 +67,8 @@ import {
   ZoomOut,
 } from "lucide-vue-next";
 import { api } from "../services/api";
-import { applyRunFrame } from "../services/runStream";
+import { mergeDraft } from "../services/draftMerge.js";
+import { applyRunFrame, createRunFrameBatcher } from "../services/runStream";
 import { stripLocalArtifactReferences } from "../services/messageFormatting";
 import { usePlatformStore } from "../stores/platform";
 import RunApprovalCard from "../components/RunApprovalCard.vue";
@@ -103,10 +115,21 @@ const pendingUploadNames = ref([]);
 const fileInput = ref(null);
 const assistantThread = ref(null);
 const saveState = ref("Ready");
+const pageLoading = ref(true);
+const assistantOpen = ref(false);
+const historyBefore = ref(0);
+const historyHasMore = ref(false);
+const historyLoading = ref(false);
+const historySessionId = ref("");
 const prompt = ref("");
 const selectedTaskId = ref("");
 const selectedAgentId = ref("");
 const selectedEdgeId = ref("");
+const canvasAddMenuOpen = ref(false);
+// The inspector is opt-in when the canvas is idle. Selecting a node/edge
+// opens it automatically; the settings button opens the workflow settings
+// view without inventing a node selection.
+const inspectorSettingsOpen = ref(false);
 const showRun = ref(false);
 const previewValues = reactive({});
 const previewFiles = reactive({});
@@ -122,6 +145,8 @@ const previewFileInput = ref(null);
 const previewUploading = ref(false);
 const previewUploadProgress = ref(0);
 const previewPendingUploadNames = ref([]);
+let previewFollowBottom = true;
+let previewScrollTimer = null;
 const previewConversationId = ref("");
 const remoteSessions = ref([]);
 const confirmation = ref(null);
@@ -145,12 +170,19 @@ const messages = ref([
 ]);
 let hydrating = true;
 let draftDirty = false;
+// Set when the last draft save was rejected as invalid (422). Sending a chat
+// message is then still allowed: the message is how the user asks the
+// Composer to repair the draft.  Conflicts (409) and network errors still block.
+let draftSaveInvalid = false;
 let draftTimer = null;
+let saveInFlight = null;
+let draftEditVersion = 0;
 let previewPollTimer = null;
 let previewRunAbortController = null;
 let persistedWorkflowSnapshot = null;
 let pendingManualChanges = [];
 const syncedManualChanges = ref([]);
+const crewDependencyDrafts = reactive({});
 
 const trackedDraftFields = [
   "name",
@@ -248,6 +280,7 @@ function markWorkflowPersisted(value) {
 }
 
 const typeInfo = {
+  tool: { label: "工具", title: "Tool call", description: "使用明确输入直接调用一个工具" },
   task: {
     label: "任务",
     title: "Crew Task",
@@ -260,13 +293,13 @@ const typeInfo = {
   },
   crew: {
     label: "Crew",
-    title: "Crew kickoff",
-    description: "在 Flow 中启动包含明确 Task 的多 Agent Crew",
+    title: "Crew call",
+    description: "在 Flow 中调用一个由连线成员组成的 Crew",
   },
   router: {
     label: "路由",
     title: "Router",
-    description: "根据上游输出产生确定性分支标签",
+    description: "按多条件规则选择一个执行分支",
   },
   code: {
     label: "代码",
@@ -276,6 +309,24 @@ const typeInfo = {
 };
 
 const creationKind = () => (route.params.kind === "flow" ? "flow" : "crew");
+function nextWorkflowName(prefix) {
+  const counters = workflow.value.node_name_counters ||= {};
+  let next = Number(counters[prefix] || 0);
+  const pattern = new RegExp(`^${prefix}_(\\d+)$`);
+  const values = [
+    ...(workflow.value.agents || []).map((item) => item.id),
+    ...(workflow.value.tasks || []).map((item) => item.id),
+    ...(workflow.value.tasks || []).flatMap((item) =>
+      (item.crew_tasks || []).map((nested) => nested.id),
+    ),
+  ];
+  values.forEach((value) => {
+    const match = String(value || '').match(pattern);
+    if (match) next = Math.max(next, Number(match[1]));
+  });
+  counters[prefix] = next + 1;
+  return `${prefix}_${counters[prefix]}`;
+}
 const emptyWorkflow = (kind = creationKind()) => ({
   id: Math.random().toString(36).slice(2, 14),
   name: "新智能体",
@@ -286,16 +337,18 @@ const emptyWorkflow = (kind = creationKind()) => ({
   planning_model_profile_id: null,
   memory: false,
   cache: true,
+  verbose: false,
   output_log_file: "",
   manager_agent_id: null,
   manager_model_profile_id: null,
-  max_rpm: null,
   max_method_calls: 100,
   model: store.defaultModel?.model || "",
   model_profile_id: store.defaultModel?.id || null,
   status: "draft",
   agents: [],
   tasks: [],
+  node_name_mode: "manual",
+  node_name_counters: { agent: 0, crew: 0, node: 0, task: 0 },
   inputs: [{
     name: "message",
     label: "用户需求",
@@ -317,11 +370,283 @@ const studioSessionId = ref("");
 const selectedTask = computed(() =>
   workflow.value.tasks.find((item) => item.id === selectedTaskId.value),
 );
+const flowTools = computed(() => store.plugins.filter((item) => ['http', 'python'].includes(item.kind)));
+const selectedFlowTool = computed(() => {
+  const id = selectedTask.value?.tool_id;
+  return flowTools.value.find((item) => String(item.id) === String(id)) || null;
+});
+function toolInputSchema(tool) {
+  const schema = tool?.input_schema || tool?.args_schema || {};
+  const properties = schema.properties || schema.fields || {};
+  return Object.entries(properties).map(([name, value]) => ({
+    name,
+    label: value.title || name,
+    description: value.description || '',
+    value_type: value.format === 'binary' || value.type === 'file' ? 'file' : (value.type === 'integer' ? 'number' : (value.type || value.format || 'string')),
+    required: Array.isArray(schema.required) && schema.required.includes(name),
+  }));
+}
+const selectedToolInputSchema = computed(() => toolInputSchema(selectedFlowTool.value));
+
+function mainSignatureParameters(source) {
+  const match = String(source || '').match(/(?:async\s+)?def\s+main\s*\(/m);
+  if (!match) return null;
+  const start = match.index + match[0].length;
+  let depth = 1;
+  let quote = '';
+  let escaped = false;
+  for (let index = start; index < source.length; index += 1) {
+    const character = source[index];
+    if (quote) {
+      if (escaped) escaped = false;
+      else if (character === '\\') escaped = true;
+      else if (character === quote) quote = '';
+      continue;
+    }
+    if (character === '"' || character === "'") {
+      quote = character;
+      continue;
+    }
+    if ('([{'.includes(character)) depth += 1;
+    else if (')]}'.includes(character)) {
+      depth -= 1;
+      if (depth === 0) return source.slice(start, index);
+    }
+  }
+  return null;
+}
+
+function splitSignatureParameters(value) {
+  const fields = [];
+  let start = 0;
+  let depth = 0;
+  let quote = '';
+  let escaped = false;
+  for (let index = 0; index < value.length; index += 1) {
+    const character = value[index];
+    if (quote) {
+      if (escaped) escaped = false;
+      else if (character === '\\') escaped = true;
+      else if (character === quote) quote = '';
+      continue;
+    }
+    if (character === '"' || character === "'") {
+      quote = character;
+      continue;
+    }
+    if ('([{'.includes(character)) depth += 1;
+    else if (')]}' .includes(character)) depth -= 1;
+    else if (character === ',' && depth === 0) {
+      fields.push(value.slice(start, index).trim());
+      start = index + 1;
+    }
+  }
+  const tail = value.slice(start).trim();
+  if (tail) fields.push(tail);
+  return fields;
+}
+
+function codeInputSchema(task) {
+  const source = String(task?.code_snippet || '');
+  const existing = task?.input_bindings || {};
+  const signature = mainSignatureParameters(source);
+  if (signature === null) return Object.keys(existing).map((name) => ({
+    name, label: name, value_type: 'object', required: true,
+    description: '代码输入（请在 main 签名中声明）',
+  }));
+  const fields = [];
+  for (const raw of splitSignatureParameters(signature)) {
+    const value = raw.trim();
+    if (!value || value.startsWith('*')) continue;
+    const left = value.split('=', 1)[0].trim();
+    const token = left.trim();
+    const annotation = token.includes(':') ? token.split(':').slice(1).join(':').trim().toLowerCase() : '';
+    const name = token.split(':', 1)[0].trim();
+    if (!/^[A-Za-z_]\w*$/.test(name)) continue;
+    fields.push({
+      name,
+      label: name,
+      value_type: existing[name]?.value_type || (annotation.includes('bool') ? 'boolean' : annotation.includes('int') || annotation.includes('float') || annotation.includes('number') ? 'number' : annotation.includes('dict') || annotation.includes('json') ? 'object' : annotation.includes('list') || annotation.includes('array') ? 'array' : 'string'),
+      required: !value.includes('='),
+      description: annotation ? `main 参数类型：${annotation}` : 'main 显式参数',
+    });
+  }
+  // A **kwargs signature is legacy/dynamic. Keep its existing bindings visible
+  // only when the signature itself cannot expose a parameter list. For an
+  // explicit signature, the signature is authoritative and removed arguments
+  // must disappear from the binding contract as well.
+  if (!fields.length) return Object.keys(existing).map((name) => ({
+    name, label: name, value_type: 'object', required: true,
+    description: '旧版动态输入；建议改为 main 的显式参数',
+  }));
+  return fields;
+}
+const selectedCodeInputSchema = computed(() => codeInputSchema(selectedTask.value));
+
+function codeTypeAnnotation(valueType) {
+  return {
+    number: 'float', boolean: 'bool', object: 'dict', array: 'list',
+  }[valueType] || '';
+}
+
+function syncCodeSignature(task, bindings) {
+  if (!task || task.node_type !== 'code') return;
+  const source = String(task.code_snippet || '');
+  const match = source.match(/(?:async\s+)?def\s+main\s*\(/m);
+  const signature = mainSignatureParameters(source);
+  if (!match || signature === null) return;
+  const open = source.indexOf('(', match.index);
+  const start = open + 1;
+  const end = start + signature.length;
+  const parameters = Object.entries(bindings || {}).map(([name, binding]) => {
+    const annotation = codeTypeAnnotation(binding?.value_type);
+    return annotation ? `${name}: ${annotation}` : name;
+  }).join(', ');
+  const next = `${source.slice(0, start)}${parameters}${source.slice(end)}`;
+  if (next !== source) task.code_snippet = next;
+}
+function selectFlowTool(task, id) {
+  task.tool_id = id || null;
+  if (!id) {
+    task.input_bindings = {};
+    return;
+  }
+  const tool = flowTools.value.find((item) => String(item.id) === String(id));
+  const next = {};
+  for (const field of toolInputSchema(tool)) {
+    next[field.name] = task.input_bindings?.[field.name] || {
+      source: 'input', variable: '', node_id: '', value: '',
+    };
+  }
+  task.input_bindings = next;
+}
+const runInputOptions = computed(() => {
+  const items = (workflow.value.inputs || []).map(input => ({
+    name: input.name,
+    label: input.label || input.description || '运行输入',
+    value_type: ({ text: 'string', long_text: 'string', image: 'file', json: 'object' })[input.input_type] || input.input_type || 'string',
+  }));
+  for (const name of ['message', 'files', 'conversation_history']) {
+    if (!items.some(item => item.name === name)) items.push({
+      name,
+      label: {
+        message: '本轮用户消息',
+        files: '本次消息附件（系统自动注入）',
+        conversation_history: '会话历史',
+      }[name],
+      value_type: {
+        message: 'string',
+        files: 'file',
+        conversation_history: 'object',
+      }[name],
+      description: {
+        message: '运行页当前发送的文字消息。',
+        files: '运行页当前消息上传的附件集合；由系统自动注入，不需要单独填写。',
+        conversation_history: '同一会话中之前已完成运行的摘要和问答。',
+      }[name],
+    });
+  }
+  return items;
+});
+
+function ancestorNodeIds(task, tasks = workflow.value.tasks) {
+  if (!task) return new Set();
+  const byId = new Map(tasks.map((item) => [item.id, item]));
+  const found = new Set();
+  const pending = [...(task.depends_on || [])];
+  while (pending.length) {
+    const id = pending.pop();
+    if (found.has(id) || !byId.has(id)) continue;
+    found.add(id);
+    pending.push(...(byId.get(id).depends_on || []));
+  }
+  return found;
+}
+
+function nodeVariableOptions(task) {
+  const items = runInputOptions.value.map((item) => ({
+    key: `input:${item.name}`,
+    ...item,
+    source: 'input',
+    variable: item.name,
+  }));
+  if (!task) return items;
+  const ancestors = ancestorNodeIds(task);
+  const previousTasks = workflow.value.tasks.filter((item) => ancestors.has(item.id));
+  for (const previous of previousTasks) {
+    const fields = previous.output_variables?.length
+      ? previous.output_variables
+      : [{ name: 'output', value_type: 'object', description: '完整节点输出' }];
+    for (const field of fields) {
+      items.push({
+        key: `node:${previous.id}:${field.name}`,
+        name: `${previous.id}.${field.name}`,
+        label: `${previous.name}（${previous.id}）· ${field.name}`,
+        source: 'node',
+        node_id: previous.id,
+        variable: field.name,
+        value_type: field.value_type || 'object',
+        description: field.description || '',
+      });
+    }
+  }
+  const unique = [...new Map(items.map((item) => [item.key, item])).values()];
+  return selectableNodeVariables(unique, task?.node_type);
+}
+function upstreamTasks(task) {
+  const ancestors = ancestorNodeIds(task);
+  return workflow.value.tasks.filter((item) => ancestors.has(item.id));
+}
+const selectedNodeVariableOptions = computed(() => nodeVariableOptions(selectedTask.value));
+function conditionVariableOptions(task) {
+  return task ? nodeVariableOptions(task) : [];
+}
+const selectedConditionVariableOptions = computed(() => conditionVariableOptions(selectedTask.value));
+
+function updateDeterministicBindings(task, bindings) {
+  if (!task) return;
+  // Bindings are the parameter contract. Canvas edges remain execution-order
+  // dependencies even when no parameter currently consumes their output.
+  const dependencies = new Set(task.depends_on || []);
+  const ancestors = ancestorNodeIds(task);
+  for (const binding of Object.values(bindings || {})) {
+    if (binding?.source === 'node' && binding.node_id && binding.node_id !== task.id &&
+        !ancestors.has(binding.node_id))
+      dependencies.add(binding.node_id);
+  }
+  task.depends_on = [...dependencies];
+  task.dependency_variables = {};
+  task.input_bindings = bindings || {};
+  syncCodeSignature(task, task.input_bindings);
+}
+
+const taskVariableOptions = computed(() => {
+  return nodeVariableOptions(selectedTask.value);
+});
+function nestedVariableOptions(nested) {
+  const items = [...taskVariableOptions.value];
+  const nestedTasks = selectedTask.value?.crew_tasks || [];
+  const ancestors = ancestorNodeIds(nested, nestedTasks);
+  for (const parent of nestedTasks.filter((item) => ancestors.has(item.id))) {
+    for (const field of parent.output_variables || fixedOutputVariables('task')) {
+      items.push({
+        key: `nested:${parent.id}:${field.name}`,
+        name: `${String(selectedTask.value?.id || 'crew_1').replaceAll('_', '')}.${String(parent.id).replaceAll('_', '')}.${field.name}`,
+        label: `${parent.name}（${String(selectedTask.value?.id || 'crew_1').replaceAll('_', '')}.${String(parent.id).replaceAll('_', '')}）· ${field.name}`,
+        source: 'node', node_id: parent.id, variable: field.name,
+        value_type: field.value_type || 'object', description: field.description || '',
+      });
+    }
+  }
+  return [...new Map(items.map(item => [item.name, item])).values()];
+}
 const selectedAgent = computed(() =>
   workflow.value.agents.find((item) => item.id === selectedAgentId.value),
 );
 const activeProposalIndex = computed(() => {
-  if (confirmation.value?.clarification) return -1;
+  // A stale clarification from an earlier discovery turn must not hide a
+  // newer inputs/architecture proposal restored from the session transcript.
+  const currentClarification = confirmation.value?.clarification;
   for (let index = messages.value.length - 1; index >= 0; index -= 1) {
     const item = messages.value[index];
     if (
@@ -337,6 +662,7 @@ const activeProposalIndex = computed(() => {
     )
       return index;
   }
+  if (currentClarification) return -1;
   return -1;
 });
 const attachedSkills = computed(() =>
@@ -371,7 +697,7 @@ const decisionOptions = computed(() => {
   const values = [];
   for (const id of selectedTask.value?.depends_on || []) {
     const dependency = workflow.value.tasks.find((item) => item.id === id);
-    if (dependency?.node_type === "router")
+    if (dependency?.node_type === "router" && !dependency.router_rules?.length)
       values.push("matched", "not_matched");
     if (dependency?.human_feedback)
       values.push(...dependency.feedback_outcomes);
@@ -389,7 +715,7 @@ const taskNodes = computed(() =>
       task,
       agent: workflow.value.agents.find((item) => item.id === task.agent_id),
       model: modelName(task),
-      type: typeInfo[task.node_type],
+      type: typeInfo[task.node_type] || { label: "不支持的旧节点", title: "Legacy step" },
     },
     selected: task.id === selectedTaskId.value,
   })),
@@ -418,19 +744,33 @@ const agentNodes = computed(() =>
 const nodes = computed(() => [...agentNodes.value, ...taskNodes.value]);
 
 const dependencyEdges = computed(() => {
-  const dependencies = workflow.value.tasks.flatMap((task) =>
-    task.depends_on.map((source) => ({ source, target: task.id })),
-  );
+  const dependencies = workflow.value.tasks.flatMap((task) => task.depends_on.flatMap((source) => {
+    const upstream = workflow.value.tasks.find(item => item.id === source);
+    if (upstream?.node_type === 'router' && Object.values(upstream.routes || {}).some(targets => targets.includes(task.id)))
+      return Object.entries(upstream.routes || {}).filter(([, targets]) => targets.includes(task.id)).map(([branch]) => ({
+        source, target: task.id, edgeType: 'route', branch,
+        label: routerBranchLabel(upstream, branch),
+      }));
+    if (task.node_type === 'router') {
+      const variables = routerConditionVariables(task, source);
+      if (variables.length) return [{
+        source, target: task.id, edgeType: 'router-condition',
+        label: `条件变量：${variables.join('、')}`,
+      }];
+    }
+    return [{ source, target: task.id, edgeType: 'dependency' }];
+  }));
   return dependencies.map((edge) => {
     const task = workflow.value.tasks.find((item) => item.id === edge.target);
     return {
-      id: `dep:${edge.source}:${edge.target}`,
+      id: edge.edgeType === 'route' ? `route:${edge.source}:${edge.branch}:${edge.target}` : `${edge.edgeType}:${edge.source}:${edge.target}`,
       source: edge.source,
       target: edge.target,
-      sourceHandle: "context-out",
+      sourceHandle: edge.edgeType === 'route' ? `route:${edge.branch}` : "context-out",
       targetHandle: "context-in",
-      label: task ? mappingLabel(task, edge.source) : "",
-      edgeType: "dependency",
+      label: ['route', 'router-condition'].includes(edge.edgeType) ? edge.label : "上游",
+      edgeType: edge.edgeType,
+      branch: edge.branch,
     };
   });
 });
@@ -491,6 +831,14 @@ const builderReady = computed(() =>
     workflow.value.structure_confirmed,
   ),
 );
+const inspectorVisible = computed(() => Boolean(
+  builderReady.value && (
+    inspectorSettingsOpen.value ||
+    selectedAgent.value ||
+    selectedTask.value ||
+    selectedEdge.value
+  ),
+));
 const previewPrimaryInput = computed(
   () =>
     workflow.value.inputs.find((item) =>
@@ -532,10 +880,13 @@ const historyProjects = computed(() => {
     }));
   const saved = store.workflows.map((item) => ({
     id: item.id,
+    application_id: item.id,
+    session_id: item.studio_session?.id || item.session_id || '',
     name: item.name,
     description: item.description,
     kind: item.kind,
     status: item.status,
+    created_at: item.created_at,
     updated_at: item.updated_at,
   }));
   const seen = new Set();
@@ -550,61 +901,153 @@ const historyProjects = computed(() => {
       const key = semanticKey(item);
       return !seen.has(key) && seen.add(key);
     })
-    .sort((a, b) => timestampValue(b.updated_at) - timestampValue(a.updated_at))
+    .sort((a, b) =>
+      timestampValue(b.created_at || b.updated_at) -
+      timestampValue(a.created_at || a.updated_at),
+    )
     .slice(0, 8);
 });
-const defaultOutputVariable = () => ({
-  name: "result",
-  description: "Complete task output",
-  value_type: "string",
-});
+const fixedOutputVariables = (nodeType = 'agent') => {
+  if (['task', 'agent', 'crew'].includes(nodeType)) return [
+    { name: 'object', value_type: 'object', description: '模型生成的结构化 JSON 对象' },
+    { name: 'file', value_type: 'file', description: '此节点实际生成或接收的文件列表' },
+    { name: 'text', value_type: 'string', description: '面向用户的正文文本' },
+  ];
+  if (nodeType === 'tool') return [
+    { name: 'object', value_type: 'object', description: '工具的结构化返回值' },
+    { name: 'file', value_type: 'file', description: '工具实际生成的文件列表' },
+    { name: 'text', value_type: 'string', description: '工具返回的文本表示' },
+  ];
+  if (nodeType === 'code') return [
+    { name: 'output', value_type: 'object', description: 'main() 返回的字典对象' },
+    { name: 'file', value_type: 'file', description: '代码节点实际生成的文件列表' },
+    { name: 'text', value_type: 'string', description: 'output.text 的文本值（若存在）' },
+  ];
+  if (nodeType === 'router') return [
+    { name: 'route', value_type: 'string', description: '命中的分支 ID' },
+  ];
+  return [];
+};
 const defaultCrewTask = (task, index = 0) => ({
-  id: Math.random().toString(36).slice(2, 10),
+  id: `task_${index + 1}`,
   name: `内部任务 ${index + 1}`,
   description: "完成 Crew 中的一项明确工作",
   expected_output: "可验证的任务结果",
-  agent_id: task?.crew_agent_ids?.[0] || workflow.value.agents[0]?.id || null,
+  // Flow Crew members are selected by Agent→Crew edges. A nested task may be
+  // assigned after a member is connected, but it must not start with a hidden
+  // first-Agent default.
+  agent_id: workflow.value.kind === "crew"
+    ? task?.crew_agent_ids?.[0] || workflow.value.agents[0]?.id || null
+    : null,
   depends_on: [],
-  output_variables: [defaultOutputVariable()],
+  output_variables: fixedOutputVariables('task'),
+  output_mode: 'text',
   dependency_variables: {},
   async_execution: false,
   markdown: false,
   output_file: "",
   create_directory: true,
-  guardrail: "",
-  guardrail_max_retries: 3,
 });
-function normalizeMappings(value) {
-  if (!value || typeof value !== "object") return {};
-  return Object.fromEntries(
-    Object.entries(value).map(([dependency, rawMappings]) => {
-      let mappings = rawMappings;
-      if (typeof mappings === "string")
-        mappings = [{ source_variable: "result", target_variable: mappings }];
-      else if (!Array.isArray(mappings)) mappings = [mappings];
-      return [
-        dependency,
-        mappings.filter(Boolean).map((item) => ({
-          source_variable: item.source_variable || "result",
-          target_variable: item.target_variable || "context",
-        })),
-      ];
-    }),
-  );
+function routerConditionVariables(task, sourceId) {
+  const found = new Set();
+  const visit = expression => {
+    if (expression?.type === 'group') (expression.conditions || []).forEach(visit);
+    else if (expression?.source === 'node' && expression.node_id === sourceId && expression.variable)
+      found.add(expression.variable);
+  };
+  (task?.router_rules || []).forEach(rule => visit(rule.expression));
+  return [...found];
 }
-function outputOptions(dependencyId) {
-  return (
-    workflow.value.tasks.find((item) => item.id === dependencyId)
-      ?.output_variables || [defaultOutputVariable()]
-  );
+function routerCases(task) {
+  if (!task?.router_rules?.length) {
+    const legacyBranches = Object.keys(task?.routes || {}).filter(id => id !== 'else');
+    return [
+      ...legacyBranches.map((id, index) => ({ id, label: index ? `CASE ${index + 1}` : 'IF', summary: task.condition || '旧版路由分支' })),
+      { id: 'else', label: 'ELSE', summary: '其他情况' },
+    ];
+  }
+  return [
+    ...(task?.router_rules || []).map((rule, index) => ({
+      id: rule.id, label: index ? `ELIF ${index + 1}` : 'IF',
+      summary: routerExpressionSummary(rule.expression),
+    })),
+    { id: 'else', label: 'ELSE', summary: '其他情况' },
+  ];
 }
-function mappingLabel(task, dependencyId) {
-  const mappings = task.dependency_variables?.[dependencyId] || [];
-  if (!mappings.length) return "完整上下文";
-  const first = mappings[0];
-  return mappings.length === 1
-    ? `${first.source_variable} → ${first.target_variable}`
-    : `${mappings.length} 个变量`;
+function routerExpressionSummary(expression, depth = 0) {
+  const labels = {
+    equals: '等于', not_equals: '不等于', contains: '包含', not_contains: '不包含',
+    starts_with: '开头为', ends_with: '结尾为', greater_than: '大于', less_than: '小于',
+    is_empty: '为空', is_not_empty: '不为空',
+  };
+  if (expression?.type === 'group') {
+    const children = (expression.conditions || []).map(child => routerExpressionSummary(child, depth + 1)).filter(Boolean);
+    const summary = children.length ? children.join(expression.operator === 'or' ? ' OR ' : ' AND ') : '未设置条件';
+    return depth ? `(${summary})` : summary;
+  }
+  const variable = expression?.source === 'node'
+    ? `${taskName(expression.node_id)} · ${expression.variable || '变量'}`
+    : (runInputOptions.value.find(item => item.name === expression?.variable)?.label || expression?.variable || '运行输入');
+  const operator = labels[expression?.operator] || expression?.operator || '等于';
+  if (['is_empty', 'is_not_empty'].includes(expression?.operator)) return `${variable} ${operator}`;
+  const value = expression?.value == null ? '' : typeof expression.value === 'object' ? JSON.stringify(expression.value) : String(expression.value);
+  return `${variable} ${operator} ${value || '""'}`;
+}
+function routerBranchLabel(task, branch) {
+  return routerCases(task).find(item => item.id === branch)?.label || branch;
+}
+function addRouterRule(task) {
+  const variables = conditionVariableOptions(task);
+  const selected = variables[0] || { source: 'input', variable: 'message', value_type: 'string' };
+  const index = (task.router_rules || []).length + 1;
+  task.router_rules ||= [];
+  const id = `case_${Math.random().toString(36).slice(2, 9)}`;
+  task.router_rules.push({
+    id,
+    expression: {
+      type: 'group', operator: 'and', conditions: [{
+        type: 'condition', source: selected.source, node_id: selected.node_id || '',
+        variable: selected.variable, value_type: selected.value_type || 'string',
+        operator: 'is_empty', value: '',
+      }],
+    },
+  });
+  task.routes ||= {};
+  task.routes[id] ||= [];
+}
+function removeRouterRule(task, index) {
+  const [removed] = task.router_rules.splice(index, 1);
+  if (removed) delete task.routes?.[removed.id];
+  if (removed) {
+    const stillRouted = new Set(Object.values(task.routes || {}).flat());
+    workflow.value.tasks.forEach(target => {
+      if (!stillRouted.has(target.id))
+        target.depends_on = (target.depends_on || []).filter(id => id !== task.id);
+    });
+  }
+}
+function updateRouterRules(task, rules) {
+  const previousSources = new Set();
+  const nextSources = new Set();
+  const collectSources = (items, target) => {
+    const visit = expression => {
+      if (expression?.type === 'group') (expression.conditions || []).forEach(visit);
+      else if (expression?.source === 'node' && expression.node_id) target.add(expression.node_id);
+    };
+    (items || []).forEach(rule => visit(rule.expression));
+  };
+  collectSources(task.router_rules, previousSources);
+  collectSources(rules, nextSources);
+  task.router_rules = rules;
+  const dependencies = new Set(task.depends_on || []);
+  previousSources.forEach(id => { if (!nextSources.has(id)) dependencies.delete(id); });
+  nextSources.forEach(id => dependencies.add(id));
+  task.depends_on = [...dependencies];
+}
+function updateRouterRule(task, index, expression) {
+  const rules = [...(task.router_rules || [])];
+  rules[index] = { ...rules[index], expression };
+  updateRouterRules(task, rules);
 }
 
 function modelName(task) {
@@ -661,10 +1104,31 @@ async function removeHistoryProject(item) {
   }
 }
 async function openHistoryProject(item) {
-  if (item.remote && !item.application_id)
-    router.push({ path: "/new-automation", query: { session: item.id } });
-  else if (item.application_id) router.push(`/studio/${item.application_id}`);
-  else router.push(`/studio/${item.id}`);
+  // A design session can be either an unbound draft or already linked to an
+  // application. Keep the session id in the URL for both cases so returning
+  // from another page restores its chat/proposal state instead of opening a
+  // blank builder. The loader will use the linked application's draft when it
+  // exists and the session proposal otherwise.
+  if (item.remote || (!item.application_id && item.id)) {
+    await router.push({ path: "/new-automation", query: { session: String(item.id) } });
+    return;
+  }
+  if (item.application_id) {
+    // The overview store may contain only the application summary. Resolve its
+    // authoritative linked DesignSession before navigating, otherwise leaving
+    // Studio and returning from Recent projects loses the in-progress chat.
+    let sessionId = item.session_id || '';
+    if (!sessionId) {
+      try {
+        const latest = await api.workflow(item.application_id);
+        sessionId = latest?.studio_session?.id || '';
+      } catch (_) { /* the application route remains a valid fallback */ }
+    }
+    const query = sessionId ? { session: String(sessionId) } : undefined;
+    await router.push({ path: `/studio/${item.application_id}`, ...(query ? { query } : {}) });
+    return;
+  }
+  await router.push(`/studio/${item.id}`);
 }
 async function startNewSession() {
   const oldAttachments = attachments.value.splice(0);
@@ -695,6 +1159,9 @@ async function startNewSession() {
   }
 }
 function migrate(item) {
+  const legacyTasks = (item.tasks || []).map(task => ({
+    ...task, output_variables: [...(task.output_variables || [])],
+  }));
   const fallback = item.agents[0]?.id || null;
   item.original_request ??= item.request || "";
   item.stage_summaries ??= {};
@@ -702,20 +1169,21 @@ function migrate(item) {
   item.planning_model_profile_id ??= null;
   item.memory ??= false;
   item.cache ??= true;
+  item.verbose ??= false;
+  delete item.share_crew;
   item.output_log_file ??= "";
   item.manager_agent_id ??= null;
   item.manager_model_profile_id ??= null;
-  item.max_rpm ??= null;
   item.max_method_calls ??= 100;
   item.interaction_mode =
     item.interaction_mode === "multi_turn" ? "multi_turn" : "single_run";
+  item.node_name_counters ||= { agent: 0, crew: 0, node: 0, task: 0 };
   item.interaction ??= {};
   item.chat_history ??= [];
   item.inputs ??= [];
   item.structure_confirmed ??= true;
   item.draft_revision ??= null;
   item.agents = item.agents.map((agent, index) => ({
-    max_rpm: null,
     max_execution_time: null,
     max_retry_limit: 2,
     max_reasoning_attempts: null,
@@ -744,18 +1212,29 @@ function migrate(item) {
           : task.node_type,
     crew_process:
       task.crew_process === "hierarchical" ? "hierarchical" : "sequential",
+    crew_memory: Boolean(task.crew_memory),
+    crew_planning: Boolean(task.crew_planning),
+    crew_cache: task.crew_cache ?? true,
+    crew_output_log_file: task.crew_output_log_file || "",
+    crew_manager_agent_id: task.crew_manager_agent_id || null,
+    crew_manager_model_profile_id: task.crew_manager_model_profile_id || null,
+    crew_planning_model_profile_id: task.crew_planning_model_profile_id || null,
+    crew_verbose: Boolean(task.crew_verbose),
     agent_id:
-      item.kind === "crew" && item.process !== "hierarchical"
+      item.kind === "crew" && item.process === "hierarchical"
+        ? null
+      : item.kind === "crew"
         ? task.agent_id || fallback
-        : task.agent_id,
+      : item.kind === "flow" && ["router", "code", "tool", "crew"].includes(task.node_type)
+          ? null
+          : task.agent_id,
     crew_agent_ids:
-      task.node_type === "crew" && !(task.crew_agent_ids || []).length
+      item.kind === "crew" && task.node_type === "crew" && !(task.crew_agent_ids || []).length
         ? item.agents.map((agent) => agent.id)
         : task.crew_agent_ids || [],
-    output_variables: task.output_variables?.length
-      ? task.output_variables
-      : [defaultOutputVariable()],
-    dependency_variables: normalizeMappings(task.dependency_variables),
+    output_variables: fixedOutputVariables(task.node_type),
+    output_mode: task.output_mode === 'json' ? 'json' : 'text',
+    dependency_variables: task.dependency_variables || {},
     async_execution: task.async_execution || false,
     human_feedback: (item.kind === "flow" && task.human_feedback) || false,
     feedback_message: task.feedback_message || "Please review this step output",
@@ -766,21 +1245,38 @@ function migrate(item) {
     markdown: task.markdown || false,
     output_file: task.output_file || "",
     create_directory: task.create_directory ?? true,
-    guardrail: task.guardrail || "",
-    guardrail_max_retries: task.guardrail_max_retries ?? 3,
+    guardrail: "",
+    guardrail_max_retries: 0,
     crew_tasks: (task.crew_tasks || []).map((nested, index) => ({
       ...defaultCrewTask(task, index),
       ...nested,
-      agent_id: nested.agent_id || task.crew_agent_ids?.[0] || fallback,
+      agent_id: task.crew_process === 'hierarchical' ? null : (nested.agent_id || null),
       depends_on: Array.isArray(nested.depends_on) ? nested.depends_on : [],
-      output_variables: nested.output_variables?.length
-        ? nested.output_variables
-        : [defaultOutputVariable()],
-      dependency_variables: normalizeMappings(nested.dependency_variables),
+      output_variables: fixedOutputVariables('task'),
+      output_mode: nested.output_mode === 'json' ? 'json' : 'text',
+      dependency_variables: {},
       create_directory: nested.create_directory ?? true,
-      guardrail_max_retries: nested.guardrail_max_retries ?? 3,
+      guardrail: "",
+      guardrail_max_retries: 0,
     })),
   }));
+  item.node_name_counters ||= { agent: 0, crew: 0, node: 0, task: 0 };
+  item.tasks.forEach((task) => {
+    if (task.node_type === 'crew') syncCrewOutputMode(task);
+    delete task.crew_share_crew;
+    (task.crew_tasks || []).forEach((nested) => delete nested.crew_share_crew);
+    if (item.kind === "flow" && ["router", "code", "tool"].includes(task.node_type))
+      task.agent_id = null;
+    if (task.node_type === 'crew' && task.crew_process === 'hierarchical') {
+      (task.crew_tasks || []).forEach((nested) => { nested.agent_id = null; });
+    }
+    if (['code', 'tool'].includes(task.node_type)) {
+      const bindings = migrateDeterministicBindings(task, legacyTasks);
+      task.input_bindings = bindings;
+      task.dependency_variables = {};
+      syncCodeSignature(task, bindings);
+    } else task.dependency_variables = {};
+  });
   // Older generated graphs stored Agents in a left vertical rail and Tasks
   // in a right vertical rail. Reflow that legacy shape once when it enters
   // the builder; manually moved nodes keep their persisted coordinates.
@@ -805,12 +1301,27 @@ function migrate(item) {
       };
     });
   }
+  const delegationManagers = new Set();
+  if (item.kind === 'crew' && item.process === 'hierarchical' && item.manager_agent_id)
+    delegationManagers.add(item.manager_agent_id);
+  item.tasks.forEach((task) => {
+    if (task.node_type !== 'crew' || task.crew_process !== 'hierarchical') return;
+    const managerId = task.crew_manager_agent_id ||
+      (!task.crew_manager_model_profile_id ? task.crew_agent_ids?.[0] : null);
+    if (managerId) delegationManagers.add(managerId);
+  });
+  item.agents.forEach((agent) => {
+    if (!delegationManagers.has(agent.id)) agent.allow_delegation = false;
+  });
   item.agents.forEach((agent) => { delete agent.code_execution_mode; });
   return item;
 }
 function hydrateWorkflow(loaded, proposal = null) {
   hydrating = true;
   workflow.value = migrate(loaded);
+  // An ungenerated application has no useful canvas to inspect yet. Open the
+  // natural-language designer automatically when entering such a session.
+  if (!workflow.value.structure_confirmed) assistantOpen.value = true;
   markWorkflowPersisted(workflow.value);
   if (proposal?.draft_sync?.manual_changes?.length)
     syncedManualChanges.value = cloneDraftValue(proposal.draft_sync.manual_changes);
@@ -832,6 +1343,8 @@ function hydrateWorkflow(loaded, proposal = null) {
         role: item.error ? "error" : item.role,
         text: item.content,
         jobId: item.job_id || "",
+        status: item.error ? "failed" : (item.status || ""),
+        error: item.error || "",
         attachments: item.attachments || [],
         proposal: migrateProposal(item.proposal),
         clarification: migrateClarification(item.clarification),
@@ -862,6 +1375,52 @@ function hydrateWorkflow(loaded, proposal = null) {
   });
   clearSelection();
   fitCanvas();
+}
+
+function mapStudioMessage(item) {
+  return {
+    role: item.error ? "error" : item.role,
+    text: item.content || "",
+    jobId: item.job_id || "",
+    status: item.error ? "failed" : (item.status || ""),
+    error: item.error || "",
+    attachments: item.attachments || [],
+    proposal: migrateProposal(item.proposal),
+    clarification: migrateClarification(item.clarification),
+    clarificationAnswer: item.clarificationAnswer || "",
+    pending: false,
+  };
+}
+
+function setStudioHistoryPage(page, { replace = true } = {}) {
+  const incoming = (page?.messages || []).map(mapStudioMessage);
+  messages.value = replace ? incoming : [...incoming, ...messages.value];
+  historyBefore.value = Number(page?.next_before ?? historyBefore.value ?? incoming.length) || 0;
+  historyHasMore.value = Boolean(page?.has_more);
+}
+
+async function loadOlderStudioMessages() {
+  if (historyLoading.value || !historyHasMore.value || !historySessionId.value) return;
+  const thread = assistantThread.value;
+  if (!thread) return;
+  historyLoading.value = true;
+  const oldHeight = thread.scrollHeight;
+  const oldTop = thread.scrollTop;
+  try {
+    const page = await api.studioSessionMessages(
+      historySessionId.value, 30, historyBefore.value,
+    );
+    setStudioHistoryPage(page, { replace: false });
+    await nextTick();
+    // Prepending must keep the message currently being read at the same
+    // viewport position instead of jumping to the newly loaded page.
+    thread.scrollTop = thread.scrollHeight - oldHeight + oldTop;
+    assistantFollowBottom = false;
+  } catch (error) {
+    store.error = error?.message || String(error);
+  } finally {
+    historyLoading.value = false;
+  }
 }
 
 async function loadWorkflow() {
@@ -929,6 +1488,9 @@ async function loadWorkflow() {
 
 async function restoreStudioSession(session, persistedWorkflow = null) {
   studioSessionId.value = String(session.id || "");
+  historySessionId.value = studioSessionId.value;
+  historyBefore.value = 0;
+  historyHasMore.value = false;
   const loaded = persistedWorkflow
     ? JSON.parse(JSON.stringify(persistedWorkflow))
     : emptyWorkflow();
@@ -943,6 +1505,24 @@ async function restoreStudioSession(session, persistedWorkflow = null) {
   // stale proposal must not reopen an old confirmation card or reset Agent
   // switches such as ask_user.
   hydrateWorkflow(loaded, loaded.structure_confirmed ? null : session.proposal);
+  if (session.id) {
+    try {
+      const transcript = await api.studioSessionMessages(session.id, 30);
+      loaded.chat_history = transcript.messages || [];
+      workflow.value.chat_history = loaded.chat_history;
+      setStudioHistoryPage(transcript);
+      // The linked application's canvas is authoritative, but an active
+      // unconfirmed architecture/input proposal still belongs to the chat
+      // transcript and must remain actionable after restore.
+      const latestProposal = [...messages.value]
+        .reverse()
+        .find((item) => item.proposal && ['inputs', 'architecture'].includes(item.proposal.stage)
+          && !item.proposal.confirmed_stages.includes(item.proposal.stage));
+      if (latestProposal) confirmation.value = latestProposal.proposal;
+    } catch (_) {
+      // The canvas remains usable when transcript loading is unavailable.
+    }
+  }
   const active = session.active_job || {};
   const pendingJob = ["queued", "planning"].includes(active.status) && active.job_id;
   if (pendingJob) {
@@ -951,10 +1531,13 @@ async function restoreStudioSession(session, persistedWorkflow = null) {
       .find((item) => item.role === "assistant" && item.jobId === active.job_id);
     if (answer) answer.pending = true;
   }
-  if (
-    pendingJob
-  )
-    await resumeStudioJob(active.job_id, session.id);
+  // Do not await the running job: it can take minutes and the page must show
+  // the canvas and transcript right away.  The job keeps streaming into its
+  // assistant message in the background.
+  if (pendingJob)
+    resumeStudioJob(active.job_id, session.id).catch((error) => {
+      store.error = error?.message || String(error);
+    });
   // A linked application's persisted draft is authoritative. A historical
   // job result can belong to an older canvas revision and must not overwrite
   // manually edited nodes when the session is reopened.
@@ -1081,11 +1664,10 @@ function migrateProposal(value) {
     recommended_process: [
       "sequential",
       "hierarchical",
-      "event_driven",
     ].includes(value.recommended_process)
       ? value.recommended_process
       : value.recommended_kind === "flow"
-        ? "event_driven"
+        ? "sequential"
         : "sequential",
     process_reason: value.process_reason || "",
     architecture_reason: value.architecture_reason || "",
@@ -1104,6 +1686,10 @@ function migrateProposal(value) {
           plugins: Array.isArray(item.plugins) ? item.plugins : [],
           memory: Boolean(item.memory),
           reasoning: Boolean(item.reasoning),
+          ...(Object.hasOwn(item, 'user_interaction')
+            ? { user_interaction: Boolean(item.user_interaction) } : {}),
+          ...(Object.hasOwn(item, 'allow_code_execution')
+            ? { allow_code_execution: Boolean(item.allow_code_execution) } : {}),
           knowledge_base_ids: Array.isArray(item.knowledge_base_ids)
             ? item.knowledge_base_ids
             : [],
@@ -1218,15 +1804,17 @@ function migrateClarification(value) {
 }
 
 onMounted(async () => {
-  await store.load();
+  store.loadResources();
+  api.studioSessions().then((sessions) => { remoteSessions.value = sessions; }).catch(() => {});
   try {
-    remoteSessions.value = await api.studioSessions();
-  } catch (_) {
-    remoteSessions.value = [];
-  }
-  await loadWorkflow();
-  if (route.name === "studio-new" && route.params.kind) {
-    openCreateDetails(route.params.kind);
+    // App.vue already starts the shared workspace load. The editor only needs
+    // its selected workflow before showing the canvas; overview and session
+    // history continue loading in the background.
+    await loadWorkflow();
+    if (route.name === "studio-new" && route.params.kind)
+      openCreateDetails(route.params.kind);
+  } finally {
+    pageLoading.value = false;
   }
   window.addEventListener("keydown", handleDeleteKey, true);
 });
@@ -1246,7 +1834,7 @@ watch(
     route.query.session,
     route.query.fresh,
   ],
-  () => {
+  async () => {
     // Saving a new workflow only changes its URL. Reloading the same object here
     // would discard transient UI state such as confirmations and preview drawers.
     if (
@@ -1256,7 +1844,9 @@ watch(
       return;
     if (busy.value && String(route.query.session || "") === String(workflow.value.id))
       return;
-    loadWorkflow();
+    pageLoading.value = true;
+    try { await loadWorkflow(); }
+    finally { pageLoading.value = false; }
   },
 );
 watch(
@@ -1269,6 +1859,12 @@ watch(
 watch(selectedAgentId, () => {
   capabilityPickerOpen.value = false;
 });
+watch(
+  [selectedAgentId, selectedTaskId, selectedEdgeId],
+  ([agentId, taskId, edgeId]) => {
+    if (agentId || taskId || edgeId) inspectorSettingsOpen.value = false;
+  },
+);
 function configureAgentInteraction(agent) {
   if (!agent.user_interaction) return;
   if (workflow.value.interaction_mode !== "multi_turn") {
@@ -1295,30 +1891,44 @@ function configureAgentInteraction(agent) {
   if (managedCrew) {
     agent.user_interaction = false;
     store.error = "Flow 内层级 Crew 只允许第一个管理 Agent 启用 ask_user";
+    return;
   }
 }
+
 function changeInteractionMode(mode) {
   if (mode === "multi_turn") workflow.value.interaction_mode = "multi_turn";
   else workflow.value.interaction_mode = "single_run";
   if (workflow.value.interaction_mode === "multi_turn") {
-    workflow.value.inputs = workflow.value.inputs.filter(
-      (input) =>
-        input.name === "message" || ["file", "image"].includes(input.input_type),
-    );
+    // Keep every confirmed business field when switching to a conversational
+    // application. ask_user only collects text and files, so typed contracts
+    // are converted to text for the Agent to parse instead of being silently
+    // deleted from the workflow.
+    workflow.value.inputs = workflow.value.inputs.map((input) => {
+      if (!["number", "boolean", "json", "image"].includes(input.input_type)) return input;
+      const original = input.input_type;
+      const hint = original === "image"
+        ? "用户通过文件上传提供图片材料。"
+        : `用户以文字提供，由 Agent 理解、校验并转换为 ${original}。`;
+      const description = input.description || "";
+      return {
+        ...input,
+        input_type: original === "image" ? "file" : original === "json" ? "long_text" : "text",
+        multiple: original === "image" ? input.multiple : false,
+        description: description.includes(hint)
+          ? description
+          : `${description}${description ? "；" : ""}${hint}`,
+      };
+    });
   }
   if (workflow.value.interaction_mode === "single_run") {
     workflow.value.agents.forEach((agent) => {
       agent.user_interaction = false;
     });
+    workflow.value.interaction ||= {};
+    workflow.value.interaction.interactive_task_ids = [];
   } else if (workflow.value.kind === "crew" && workflow.value.process === "hierarchical") {
     const managerId = workflow.value.manager_agent_id || workflow.value.agents[0]?.id;
     setManager(managerId);
-  } else {
-    const first = workflow.value.tasks[0];
-    const collectorId = first?.node_type === "crew" ? "" : first?.agent_id;
-    workflow.value.agents.forEach((agent) => {
-      agent.user_interaction = agent.id === collectorId;
-    });
   }
 }
 watch(
@@ -1326,7 +1936,11 @@ watch(
   (value) => {
     graphNodes.value = value;
   },
-  { immediate: true, deep: true },
+  // Node data contains the complete reactive task/agent definition. A deep
+  // watcher walks every nested condition and input on every edit, then gives
+  // Vue Flow a fresh copy of the entire canvas. The node list itself is the
+  // structural/position contract; nested data updates are reactive already.
+  { immediate: true },
 );
 watch(
   edges,
@@ -1338,30 +1952,16 @@ watch(
       }, 60),
     );
   },
-  { immediate: true, deep: true },
+  { immediate: true },
 );
 watch(workflow, () => scheduleDraft(), { deep: true });
-watch(
+  watch(
   messages,
   (value) => {
     if (hydrating) return;
-    workflow.value.chat_history = value
-      .filter(
-        (item) =>
-          ["user", "assistant"].includes(item.role) &&
-          item.text,
-      )
-      .slice(-40)
-      .map((item) => ({
-        role: item.role,
-        content: item.text,
-        job_id: item.jobId || "",
-        attachments: item.attachments || [],
-        proposal: item.proposal || null,
-        clarification: item.clarification || null,
-        clarificationAnswer: item.clarificationAnswer || "",
-      }));
-    scheduleDraft();
+    // Chat transcript is persisted by the Studio session API. Keep it out of
+    // the application draft watcher: streaming every Composer delta must not
+    // enqueue canvas saves or advance draft_revision.
     scrollChat();
   },
   { deep: true },
@@ -1375,11 +1975,26 @@ watch(
   { deep: true },
 );
 
-function scrollChat() {
-  nextTick(() => {
-    if (assistantThread.value)
-      assistantThread.value.scrollTop = assistantThread.value.scrollHeight;
-  });
+let assistantFollowBottom = true;
+let assistantScrollTimer = null;
+function onAssistantScroll() {
+  const element = assistantThread.value;
+  if (element) {
+    assistantFollowBottom = element.scrollHeight - element.scrollTop - element.clientHeight < 96;
+    if (element.scrollTop <= 24) loadOlderStudioMessages();
+  }
+}
+function scrollChat(force = false) {
+  if (force) assistantFollowBottom = true;
+  if (!assistantFollowBottom) return;
+  if (assistantScrollTimer) window.clearTimeout(assistantScrollTimer);
+  assistantScrollTimer = window.setTimeout(() => {
+    assistantScrollTimer = null;
+    nextTick(() => {
+      if (assistantThread.value && assistantFollowBottom)
+        assistantThread.value.scrollTop = assistantThread.value.scrollHeight;
+    });
+  }, 32);
 }
 function keepUploadStatusVisible(startedAt, minimumMs = 450) {
   return new Promise((resolve) =>
@@ -1392,6 +2007,15 @@ function keepUploadStatusVisible(startedAt, minimumMs = 450) {
 
 function scheduleDraft() {
   if (hydrating) return;
+  if (workflow.value.structure_confirmed && persistedWorkflowSnapshot &&
+      JSON.stringify(trackedDraftFields.map((field) => workflow.value[field])) ===
+      JSON.stringify(trackedDraftFields.map((field) => persistedWorkflowSnapshot[field]))) {
+    draftDirty = false;
+    if (saveState.value === "Unsaved changes" || saveState.value === "Saving draft...")
+      saveState.value = "Draft saved";
+    return;
+  }
+  draftEditVersion += 1;
   draftDirty = true;
   saveState.value = "Unsaved changes";
   if (draftTimer) window.clearTimeout(draftTimer);
@@ -1422,28 +2046,63 @@ async function autoSave() {
     }
     return;
   }
-  draftDirty = false;
-  saveState.value = "Saving draft...";
-  const manualChanges = currentManualChanges();
   try {
-    const result = await api.saveWorkflow(workflow.value, manualChanges);
-    hydrating = true;
-    workflow.value.id = result.id;
-    workflow.value.updated_at = result.updated_at;
-    workflow.value.draft_revision = result.draft_revision;
-    workflow.value.draft_sync = result.draft_sync || workflow.value.draft_sync;
-    markWorkflowPersisted(workflow.value);
-    await nextTick();
-    hydrating = false;
-    saveState.value = "Draft saved";
-    await store.load();
-    if (!route.params.id || route.params.id !== result.id)
-      router.replace(`/studio/${result.id}`);
+    await persistWorkflowDraft();
+    draftSaveInvalid = false;
   } catch (error) {
     draftDirty = true;
-    saveState.value = "Draft pending";
+    draftSaveInvalid = error?.status === 422;
+    saveState.value = draftSaveInvalid ? "草稿有错误，可发送消息修复" : "Draft pending";
     store.error = error.message;
   }
+}
+
+async function persistWorkflowDraft() {
+  if (saveInFlight) {
+    await saveInFlight;
+    if (!draftDirty) return workflow.value;
+  }
+  const version = draftEditVersion;
+  const submitted = cloneDraftValue(workflow.value);
+  const baseline = cloneDraftValue(persistedWorkflowSnapshot || submitted);
+  const manualChanges = currentManualChanges();
+  saveState.value = "Saving draft...";
+  const task = (async () => {
+    let saved;
+    try {
+      saved = migrate(await api.saveWorkflow(submitted, manualChanges));
+    } catch (error) {
+      if (error.status !== 409 || !/^\d+$/.test(String(submitted.id || ''))) throw error;
+      const latest = migrate(await api.workflow(submitted.id));
+      const { merged, conflicts } = mergeDraft(baseline, submitted, latest);
+      if (conflicts.length)
+        throw new Error(`草稿中的 ${conflicts.join('、')} 已在别处修改，请刷新后核对这些字段`);
+      saved = migrate(await api.saveWorkflow(merged, manualChanges));
+    }
+    const hadLaterEdits = draftEditVersion !== version;
+    hydrating = true;
+    if (hadLaterEdits) {
+      workflow.value.id = saved.id;
+      workflow.value.updated_at = saved.updated_at;
+      workflow.value.draft_revision = saved.draft_revision;
+      workflow.value.draft_sync = saved.draft_sync;
+    } else workflow.value = saved;
+    markWorkflowPersisted(saved);
+    await nextTick();
+    hydrating = false;
+    draftDirty = hadLaterEdits;
+    saveState.value = hadLaterEdits ? "Unsaved changes" : "Draft saved";
+    if (hadLaterEdits) scheduleDraft();
+    const index = store.workflows.findIndex((item) => String(item.id) === String(saved.id));
+    if (index >= 0) store.workflows.splice(index, 1, saved);
+    else store.workflows.unshift(saved);
+    if (String(route.params.id || '') !== String(saved.id))
+      await router.replace(`/studio/${saved.id}`);
+    return saved;
+  })();
+  saveInFlight = task;
+  try { return await task; }
+  finally { if (saveInFlight === task) saveInFlight = null; }
 }
 
 function syncEdges(value, instance = flowInstance.value) {
@@ -1523,10 +2182,21 @@ function applyStudioResult(finalResult, answer) {
   if (finalResult.workflow) {
     applyGeneratedWorkflow(finalResult.workflow);
   }
-  if (finalResult.phase === "failed")
+  if (finalResult.phase === "failed") {
+    if (answer) {
+      answer.status = "failed";
+      answer.error = finalResult.error || "请求未完成";
+      answer.role = "error";
+      answer.streaming = false;
+      answer.pending = false;
+      answer.text ||= `没有完成：${answer.error}`;
+    }
     throw new Error(finalResult.error || "请求未完成");
+  }
   if (answer) {
     answer.pending = false;
+    answer.status = finalResult.phase === 'ready' || finalResult.phase === 'awaiting_confirmation'
+      ? 'completed' : (answer.status || 'completed');
     if (!answer.text) answer.text = finalResult.reply || "已完成。";
     answer.streaming = false;
   }
@@ -1568,6 +2238,7 @@ function applyGeneratedWorkflow(value) {
     throw new Error("生成结果缺少 Agent 或 Task，未载入画布；请重试生成阶段");
   }
   const historySnapshot = workflow.value.chat_history;
+  hydrating = true;
   workflow.value = migrate(value);
   workflow.value.chat_history = historySnapshot;
   workflow.value.structure_confirmed = true;
@@ -1575,12 +2246,17 @@ function applyGeneratedWorkflow(value) {
   // are reported as manual canvas changes.
   markWorkflowPersisted(workflow.value);
   confirmation.value = null;
-  selectedTaskId.value = value.tasks[0]?.id || "";
+  // Do not force the first task into the inspector after generation. The
+  // generated graph should use the available canvas area until the user
+  // explicitly selects a node or opens orchestration settings.
+  selectedTaskId.value = "";
   selectedAgentId.value = "";
   selectedEdgeId.value = "";
+  inspectorSettingsOpen.value = false;
   fitCanvas(220);
   draftDirty = false;
   saveState.value = "Draft saved";
+  hydrating = false;
   if (/^\d+$/.test(String(workflow.value.id || "")) &&
       String(route.params.id || "") !== String(workflow.value.id)) {
     router.replace(`/studio/${workflow.value.id}`);
@@ -1660,7 +2336,7 @@ async function sendMessage() {
   // a newer draft through natural-language generation.
   if (draftDirty && workflow.value.structure_confirmed) {
     await autoSave();
-    if (draftDirty) return;
+    if (draftDirty && !draftSaveInvalid) return;
   }
   const history = messages.value
     .filter((item) => ["user", "assistant"].includes(item.role))
@@ -1709,10 +2385,66 @@ async function sendMessage() {
       pendingClarification.clarification.selectedLabel = "";
     }
     answer.streaming = false;
+    answer.status = "failed";
+    answer.error = error.message;
     answer.text ||= `没有完成：${error.message}`;
     answer.role = "error";
     store.error = error.message;
   } finally {
+    busy.value = false;
+    activity.value = null;
+  }
+}
+
+// Every failed Studio turn must carry role, error and status together: the
+// retry button is rendered only when all of them (plus jobId) are present.
+function markStudioFailure(answer, error) {
+  const message = error?.message || String(error || "请求未完成");
+  answer.streaming = false;
+  answer.pending = false;
+  answer.status = "failed";
+  answer.error = message;
+  answer.role = "error";
+  answer.text ||= `没有完成：${message}`;
+  store.error = message;
+}
+
+// Only the latest failed turn can be retried.  Once the user has sent
+// another message (or another job started), an older failure is history:
+// retrying it would replay a request against a newer proposal state.
+function isRetryableStudioMessage(index) {
+  const message = messages.value[index];
+  if (!message?.jobId || message.streaming || message.role !== "error" || !message.error) return false;
+  return !messages.value
+    .slice(index + 1)
+    .some((item) => item.role === "user" || item.jobId);
+}
+
+async function retryStudioMessage(message) {
+  const index = messages.value.indexOf(message);
+  if (index < 0 || !isRetryableStudioMessage(index) || busy.value || message.retrying) return;
+  message.retrying = true;
+  busy.value = true;
+  message.streaming = true;
+  message.role = 'assistant';
+  message.error = '';
+  message.text = '';
+  message.files = [];
+  activity.value = { phase: 'working', plan: [] };
+  try {
+    const pending = await api.retryStudioJob(message.jobId);
+    message.jobId = pending.job_id;
+    await consumeStudioJob(pending.job_id, message);
+  } catch (error) {
+    message.streaming = false;
+    message.role = 'error';
+    message.status = 'failed';
+    message.error = error.message;
+    message.text ||= `没有完成：${error.message}`;
+    store.error = error.message;
+  } finally {
+    message.retrying = false;
+    message.streaming = false;
     busy.value = false;
     activity.value = null;
   }
@@ -1753,6 +2485,63 @@ function addWorkflowInput() {
     multiple: false,
   });
 }
+function normalizeProposalInputType(item) {
+  if (!['file', 'image'].includes(item.input_type)) return;
+  item.name = 'files';
+  item.label = '本轮文件';
+  item.input_type = 'file';
+  item.multiple = true;
+  item.description = '用户每轮对话上传的文件列表，后续轮次追加，不覆盖已有文件。';
+  const duplicates = confirmation.value.inputs
+    .map((value, index) => ({ value, index }))
+    .filter(({ value }) => value !== item && ['file', 'image'].includes(value.input_type));
+  duplicates.reverse().forEach(({ index }) => confirmation.value.inputs.splice(index, 1));
+}
+function renameWorkflowInput(input, event) {
+  const next = event.target.value.trim();
+  const current = input.name;
+  if (current === 'message' || !/^[A-Za-z_]\w*$/.test(next) ||
+      workflow.value.inputs.some((item) => item !== input && item.name === next)) {
+    event.target.value = current;
+    return;
+  }
+  input.name = next;
+  for (const task of workflow.value.tasks) {
+    for (const binding of Object.values(task.input_bindings || {})) {
+      if (binding.source === 'input' && binding.variable === current) binding.variable = next;
+    }
+  }
+}
+function changeWorkflowInputType(input, value) {
+  input.input_type = value;
+  if (['file', 'image'].includes(value)) {
+    const existing = workflow.value.inputs.find((item) =>
+      item !== input && ['file', 'image'].includes(item.input_type),
+    );
+    if (existing) workflow.value.inputs.splice(workflow.value.inputs.indexOf(existing), 1);
+    input.name = 'files';
+    input.label = '本轮文件';
+    input.multiple = true;
+    input.description = '用户每轮对话上传的文件列表，后续轮次追加，不覆盖已有文件。';
+  } else {
+    input.multiple = false;
+  }
+}
+function removeWorkflowInput(input, index) {
+  if (!input || input.name === 'message') return;
+  const removedName = input.name;
+  workflow.value.inputs.splice(index, 1);
+  // Do not leave a saved code/tool contract pointing at a deleted runtime
+  // field. Preserve the argument so the inspector can show the missing
+  // variable and the user can rebind it before saving.
+  for (const task of workflow.value.tasks) {
+    for (const binding of Object.values(task.input_bindings || {})) {
+      if (binding.source === 'input' && binding.variable === removedName) {
+        binding.variable = '';
+      }
+    }
+  }
+}
 function isActiveProposal(index) {
   return index === activeProposalIndex.value;
 }
@@ -1785,13 +2574,13 @@ function setProposalKind(proposal, kind) {
   proposal.recommended_kind = kind;
   proposal.recommended_process =
     kind === "flow"
-      ? "event_driven"
+      ? "sequential"
       : ["sequential", "hierarchical"].includes(proposal.recommended_process)
         ? proposal.recommended_process
         : "sequential";
   proposal.process_reason =
     kind === "flow"
-      ? "确认后将按事件驱动、状态与分支关系重新生成 Flow。"
+      ? "确认后将按顺序、状态与分支关系重新生成 Flow。"
       : "确认后将按 Agent 与 Task 的协作关系重新生成 Crew。";
   confirmation.value = proposal;
   scheduleDraft();
@@ -1855,10 +2644,7 @@ async function confirmProposalStage(message, messageIndex) {
       (item) => item !== stage,
     );
     confirmation.value = active;
-    answer.streaming = false;
-    answer.text ||= `没有完成：${error.message}`;
-    answer.role = "error";
-    store.error = error.message;
+    markStudioFailure(answer, error);
   } finally {
     busy.value = false;
     message.submitting = false;
@@ -1902,10 +2688,7 @@ async function chooseClarificationOption(message, option) {
     clarification.locked = false;
     clarification.selected = "";
     clarification.selectedLabel = "";
-    answer.streaming = false;
-    answer.text ||= `没有完成：${error.message}`;
-    answer.role = "error";
-    store.error = error.message;
+    markStudioFailure(answer, error);
   } finally {
     busy.value = false;
     activity.value = null;
@@ -1979,14 +2762,9 @@ async function save() {
   }
   saveState.value = "Saving...";
   try {
-    hydrating = true;
-    const saved = migrate(await api.saveWorkflow(workflow.value, currentManualChanges()));
-    workflow.value = saved;
-    markWorkflowPersisted(workflow.value);
-    await nextTick();
-    hydrating = false;
-    draftDirty = false;
-    await store.load();
+    syncAgentDelegation();
+    await persistWorkflowDraft();
+    if (draftDirty) await persistWorkflowDraft();
     saveState.value = "Saved";
     store.notify("工作流已保存");
     if (!route.params.id || route.params.id !== workflow.value.id)
@@ -2022,25 +2800,21 @@ async function publish() {
 async function ensurePreviewApplicationId() {
   if (!workflow.value.structure_confirmed)
     throw new Error("请先完成编排并生成可运行方案");
+  // Previewing an unchanged saved draft does not need another full graph
+  // persistence cycle (relations, resources and revision metadata).
+  if (/^\d+$/.test(String(workflow.value.id || "")) && !draftDirty && !saveInFlight)
+    return Number(workflow.value.id);
   if (draftTimer) {
     window.clearTimeout(draftTimer);
     draftTimer = null;
   }
   saveState.value = "Saving draft...";
-  const saved = migrate(await api.saveWorkflow(workflow.value, currentManualChanges()));
+  syncAgentDelegation();
+  let saved = await persistWorkflowDraft();
+  if (draftDirty) saved = await persistWorkflowDraft();
   if (!/^\d+$/.test(String(saved.id || "")))
     throw new Error("应用保存后未返回有效的整数 ID");
   saved.id = Number(saved.id);
-  hydrating = true;
-  workflow.value = saved;
-  markWorkflowPersisted(workflow.value);
-  await nextTick();
-  hydrating = false;
-  draftDirty = false;
-  saveState.value = "Draft saved";
-  await store.load();
-  if (String(route.params.id || "") !== String(saved.id))
-    await router.replace(`/studio/${saved.id}`);
   return saved.id;
 }
 
@@ -2164,11 +2938,48 @@ async function choosePreviewFiles(event) {
 function removePreviewFile(inputName, index) {
   previewFiles[inputName].splice(index, 1);
 }
-function scrollPreview() {
-  nextTick(() => {
-    if (previewThread.value)
-      previewThread.value.scrollTop = previewThread.value.scrollHeight;
-  });
+async function retryPreviewMessage(message) {
+  if (!isLatestRunMessage(previewMessages.value, message) || previewBusy.value) return;
+  message.retrying = true;
+  message.role = 'assistant';
+  message.error = '';
+  message.text = '';
+  message.files = [];
+  message.turns = [];
+  message.finalTurnId = '';
+  message.activity = '';
+  message.streaming = true;
+  previewBusy.value = true;
+  try {
+    await api.retryRun(message.runId);
+    await streamPreview(message.runId, message);
+  } catch (error) {
+    message.role = 'error';
+    message.error = error.message;
+    message.text = `没有完成：${error.message}`;
+    message.streaming = false;
+    store.error = error.message;
+  } finally {
+    message.retrying = false;
+    previewBusy.value = false;
+  }
+}
+function onPreviewScroll() {
+  const element = previewThread.value;
+  if (element)
+    previewFollowBottom = element.scrollHeight - element.scrollTop - element.clientHeight < 80;
+}
+function scrollPreview(force = false) {
+  if (force) previewFollowBottom = true;
+  if (!previewFollowBottom) return;
+  if (previewScrollTimer) window.clearTimeout(previewScrollTimer);
+  previewScrollTimer = window.setTimeout(() => {
+    previewScrollTimer = null;
+    nextTick(() => {
+      if (previewThread.value && previewFollowBottom)
+        previewThread.value.scrollTop = previewThread.value.scrollHeight;
+    });
+  }, 32);
 }
 function openPreviewFeedback(runId, pendingFeedback, answer) {
   answer.approvals ||= [];
@@ -2187,7 +2998,7 @@ function openPreviewFeedback(runId, pendingFeedback, answer) {
       busy: false,
     });
   answer.text = "";
-  answer.status = "waiting_for_feedback";
+  answer.status = "waiting_approval";
   answer.streaming = false;
   previewBusy.value = false;
   scrollPreview();
@@ -2204,6 +3015,9 @@ async function submitPreviewFeedback(answer, approval, outcome) {
     approval.status = "submitted";
     approval.outcome = outcome;
     answer.text = "";
+    answer.turns = [];
+    answer.finalTurnId = "";
+    answer.activity = "";
     answer.streaming = true;
     answer.status = "queued";
     previewBusy.value = true;
@@ -2226,7 +3040,6 @@ async function pollPreview(id, answer) {
       answer.routerOnly =
         record.metrics?.runtime_type === "conversation_router";
       previewBusy.value = false;
-      await store.load();
       scrollPreview();
       return;
     }
@@ -2236,13 +3049,11 @@ async function pollPreview(id, answer) {
       answer.error = record.error || "执行失败";
       answer.streaming = false;
       previewBusy.value = false;
-      await store.load();
       scrollPreview();
       return;
     }
-    if (record.status === "waiting_for_feedback") {
+    if (record.status === "waiting_approval") {
       openPreviewFeedback(record.id, record.pending_feedback, answer);
-      await store.load();
       return;
     }
     previewPollTimer = window.setTimeout(() => pollPreview(id, answer), 900);
@@ -2267,20 +3078,21 @@ async function streamPreview(id, answer) {
   previewRunAbortController = controller;
   let terminal = "";
   try {
-    await api.runEvents(
-      id,
-      (frame) => {
+    const batcher = createRunFrameBatcher((frame) => {
         terminal = applyRunFrame(answer, frame) || terminal;
-        if (frame.type === "waiting_for_feedback")
+        if (frame.type === "approval.required")
           openPreviewFeedback(id, frame.pending_feedback || {}, answer);
         scrollPreview();
-      },
+      });
+    await api.runEvents(
+      id,
+      (frame) => batcher.push(frame),
       controller.signal,
       answer.eventCursor || 0,
     );
+    await batcher.finish();
     if (!terminal) return pollPreview(id, answer);
     previewBusy.value = false;
-    await store.load();
     scrollPreview();
   } catch (error) {
     if (error.name !== "AbortError") await pollPreview(id, answer);
@@ -2321,6 +3133,13 @@ async function sendPreview() {
       status: "queued",
       runId: "",
       steps: [],
+      turns: [],
+      finalTurnId: "",
+      retryPayload: {
+        inputs: JSON.parse(JSON.stringify(inputs)),
+        attachments: JSON.parse(JSON.stringify(attachmentBindings)),
+        message: submittedMessage,
+      },
     });
     previewMessages.value.push(answer);
     previewMessage.value = "";
@@ -2364,9 +3183,33 @@ function changeProcess(process) {
       if (!task.agent_id)
         task.agent_id = workflow.value.agents[0]?.id || addAgent();
     });
+    syncAgentDelegation();
   } else {
     setManager(workflow.value.manager_agent_id || workflow.value.agents[0]?.id || addAgent());
   }
+}
+function hierarchicalManagerIds() {
+  const ids = new Set();
+  if (workflow.value.kind === 'crew' && workflow.value.process === 'hierarchical' &&
+      workflow.value.manager_agent_id) {
+    ids.add(workflow.value.manager_agent_id);
+  }
+  for (const task of workflow.value.tasks) {
+    if (task.node_type !== 'crew' || task.crew_process !== 'hierarchical') continue;
+    const managerId = task.crew_manager_agent_id ||
+      (!task.crew_manager_model_profile_id ? task.crew_agent_ids?.[0] : null);
+    if (managerId) ids.add(managerId);
+  }
+  return ids;
+}
+const selectedAgentCanDelegate = computed(() =>
+  Boolean(selectedAgent.value && hierarchicalManagerIds().has(selectedAgent.value.id)),
+);
+function syncAgentDelegation() {
+  const managers = hierarchicalManagerIds();
+  workflow.value.agents.forEach((agent) => {
+    if (!managers.has(agent.id)) agent.allow_delegation = false;
+  });
 }
 function setManager(agentId) {
   workflow.value.manager_agent_id = agentId || null;
@@ -2374,26 +3217,47 @@ function setManager(agentId) {
     workflow.value.tasks.forEach((task) => {
       if (task.agent_id === agentId) task.agent_id = null;
     });
+    const manager = workflow.value.agents.find((agent) => agent.id === agentId);
+    if (manager) manager.allow_delegation = true;
     workflow.value.agents.forEach((agent) => {
-      agent.allow_delegation = agent.id === agentId;
       if (workflow.value.interaction_mode === "multi_turn")
         agent.user_interaction = agent.id === agentId;
     });
   }
+  syncAgentDelegation();
 }
 function changeEmbeddedCrewProcess(task, process) {
   task.crew_process = process;
-  if (process !== "hierarchical" || !task.crew_agent_ids.length) return;
-  const managerId = task.crew_agent_ids[0];
+  if (process !== "hierarchical") {
+    task.crew_manager_agent_id = null;
+    task.crew_manager_model_profile_id = null;
+    syncAgentDelegation();
+    return;
+  }
+  if (!task.crew_agent_ids.length) return;
+  const managerId = task.crew_manager_agent_id || task.crew_agent_ids[0];
+  task.crew_manager_agent_id = managerId;
+  const manager = workflow.value.agents.find((agent) => agent.id === managerId);
+  if (manager) manager.allow_delegation = true;
   workflow.value.agents.forEach((agent) => {
-    if (!task.crew_agent_ids.includes(agent.id)) return;
-    agent.allow_delegation = agent.id === managerId;
-    if (workflow.value.interaction_mode === "multi_turn")
+    if (workflow.value.interaction_mode === "multi_turn" && task.crew_agent_ids.includes(agent.id))
       agent.user_interaction = agent.id === managerId;
   });
   task.crew_tasks.forEach((nested) => {
     nested.agent_id = null;
   });
+  syncAgentDelegation();
+}
+function changeEmbeddedCrewManager(task, managerId) {
+  task.crew_manager_agent_id = managerId || null;
+  if (managerId) {
+    const manager = workflow.value.agents.find((agent) => agent.id === managerId);
+    if (manager) manager.allow_delegation = true;
+  }
+  if (task.crew_process === 'hierarchical') {
+    (task.crew_tasks || []).forEach((nested) => { nested.agent_id = null; });
+  }
+  syncAgentDelegation();
 }
 function toggleCrewMember(agentId) {
   const task = selectedTask.value;
@@ -2406,15 +3270,28 @@ function toggleCrewMember(agentId) {
     }
     task.crew_agent_ids.splice(index, 1);
     if (task.agent_id === agentId) task.agent_id = null;
+    if (task.crew_manager_agent_id === agentId) {
+      task.crew_manager_agent_id = task.crew_process === 'hierarchical'
+        ? task.crew_agent_ids[0] || null
+        : null;
+    }
     (task.crew_tasks || []).forEach((item) => {
       if (item.agent_id === agentId)
-        item.agent_id = task.crew_agent_ids[0] || null;
+        item.agent_id = null;
     });
-  } else task.crew_agent_ids.push(agentId);
+  } else {
+    task.crew_agent_ids.push(agentId);
+    if (task.crew_process === 'hierarchical' && !task.crew_manager_agent_id &&
+        !task.crew_manager_model_profile_id) {
+      task.crew_manager_agent_id = task.crew_agent_ids[0] || null;
+    }
+  }
+  syncAgentDelegation();
 }
 function addAgent() {
   workflow.value.structure_confirmed = true;
-  const id = Math.random().toString(36).slice(2, 10);
+  workflow.value.node_name_mode = 'manual';
+  const id = nextWorkflowName('agent');
   const index = workflow.value.agents.length;
   workflow.value.agents.push({
     id,
@@ -2426,7 +3303,6 @@ function addAgent() {
     plugins: [],
     knowledge_base_ids: [],
     max_iter: 12,
-    max_rpm: null,
     max_execution_time: null,
     max_retry_limit: 2,
     reasoning: false,
@@ -2454,11 +3330,21 @@ function addAgent() {
 }
 function addStep(requestedType) {
   workflow.value.structure_confirmed = true;
+  workflow.value.node_name_mode = 'manual';
   const type = workflow.value.kind === "crew" ? "task" : requestedType;
-  const id = Math.random().toString(36).slice(2, 10);
-  const needsAgent = type !== "router";
-  const agentId = needsAgent
-    ? workflow.value.agents[0]?.id || addAgent()
+  const prefix = workflow.value.kind === 'crew'
+    ? 'task'
+    : requestedType === 'agent'
+      ? 'agent'
+      : requestedType === 'crew'
+        ? 'crew'
+        : 'node';
+  const id = nextWorkflowName(prefix);
+  // Flow execution is defined by Agent -> step edges. Do not silently attach
+  // the first Agent: an unconnected step must remain visibly unassigned until
+  // the user draws the intended relation on the canvas.
+  const agentId = workflow.value.kind === "crew"
+    ? workflow.value.agents[0]?.id || null
     : null;
   const count = workflow.value.tasks.length;
   workflow.value.tasks.push({
@@ -2469,25 +3355,35 @@ function addStep(requestedType) {
       type === "router"
         ? "A deterministic route label."
         : "A complete and verifiable result.",
-    agent_id: type === "crew" ? null : agentId,
-    crew_agent_ids:
-      type === "crew" ? workflow.value.agents.map((item) => item.id) : [],
-    crew_tasks:
-      type === "crew"
-        ? [
-            defaultCrewTask({
-              crew_agent_ids: workflow.value.agents.map((item) => item.id),
-            }),
-          ]
-        : [],
+    agent_id: agentId,
+    crew_agent_ids: [],
+    crew_tasks: [],
     depends_on: [],
-    output_variables: [defaultOutputVariable()],
+    output_variables: fixedOutputVariables(type),
+    output_mode: 'text',
     dependency_variables: {},
     node_type: type,
+    execution_contract: ['code','tool'].includes(type) ? 'object' : 'legacy',
+    input_bindings: {},
+    tool_id: null,
+    code_snippet: type === 'code' ? 'def main(message):\n    return {"text": message}\n' : '',
+    ...(type === 'code' ? {
+      input_bindings: { message: { source: 'input', variable: 'message', node_id: '', value: '' } },
+    } : {}),
+
     crew_process: "sequential",
-    condition: type === "router" ? "contains:approved" : "",
+    crew_memory: false,
+    crew_planning: false,
+    crew_cache: true,
+    crew_output_log_file: "",
+    crew_manager_agent_id: null,
+    crew_manager_model_profile_id: null,
+    crew_planning_model_profile_id: null,
+    crew_verbose: false,
+    condition: "",
     run_if: "",
-    routes: {},
+    routes: type === 'router' ? { else: [] } : {},
+    router_rules: [],
     async_execution: false,
     human_feedback: false,
     feedback_message: "Please review this step output",
@@ -2497,18 +3393,53 @@ function addStep(requestedType) {
     output_file: "",
     create_directory: true,
     guardrail: "",
-    guardrail_max_retries: 3,
+    guardrail_max_retries: 0,
     position: { x: 120 + count * CANVAS_COLUMN_GAP, y: CANVAS_TASK_Y },
   });
+  if (type === 'router') {
+    const task = workflow.value.tasks[workflow.value.tasks.length - 1];
+    const message = runInputOptions.value.find(item => item.name === 'message');
+    task.router_rules.push({
+      id: 'case_1',
+      expression: { type: 'group', operator: 'and', conditions: [{
+        type: 'condition', source: 'input', variable: message?.name || 'message',
+        value_type: message?.value_type || 'string', operator: 'is_empty', value: '',
+      }] },
+    });
+    task.routes.case_1 = [];
+  }
   selectedTaskId.value = id;
   selectedAgentId.value = "";
   selectedEdgeId.value = "";
   fitCanvas();
 }
+function addCanvasNode(type) {
+  canvasAddMenuOpen.value = false;
+  if (type === 'agent-definition') addAgent();
+  else addStep(type);
+}
+// The Crew container exposes the final internal task's output contract.
+function crewFinalTask(task) {
+  const pending = [...(task?.crew_tasks || [])]; const done = new Set(); let last = null;
+  while (pending.length) {
+    const index = pending.findIndex(item => (item.depends_on || []).every(id => done.has(id)));
+    if (index < 0) break;
+    last = pending.splice(index, 1)[0]; done.add(last.id);
+  }
+  return last;
+}
+function syncCrewOutputMode(task) {
+  const final = crewFinalTask(task);
+  task.output_mode = final?.output_mode || 'text';
+}
 function addCrewTask(task) {
   if (!task || task.node_type !== "crew") return;
+  workflow.value.node_name_mode = 'manual';
   task.crew_tasks ||= [];
-  task.crew_tasks.push(defaultCrewTask(task, task.crew_tasks.length));
+  const nested = defaultCrewTask(task, task.crew_tasks.length);
+  nested.id = nextWorkflowName('task');
+  task.crew_tasks.push(nested);
+  syncCrewOutputMode(task);
 }
 function removeCrewTask(task, index) {
   if (!task?.crew_tasks?.length) return;
@@ -2519,79 +3450,59 @@ function removeCrewTask(task, index) {
       (id) => id !== removed?.id,
     );
   });
+  syncCrewOutputMode(task);
+}
+function availableCrewTaskDependencies(task, nested) {
+  const nestedTasks = task?.crew_tasks || [];
+  return nestedTasks.filter((candidate) =>
+    candidate.id !== nested?.id,
+  );
+}
+function nestedDependencyWouldCycle(task, nested, candidateId) {
+  const byId = new Map((task?.crew_tasks || []).map((item) => [item.id, item]));
+  const pending = [candidateId];
+  const visited = new Set();
+  while (pending.length) {
+    const id = pending.pop();
+    if (id === nested?.id) return true;
+    if (visited.has(id)) continue;
+    visited.add(id);
+    pending.push(...(byId.get(id)?.depends_on || []));
+  }
+  return false;
+}
+function dependencyRowKey(task, nested) {
+  return `${task?.id || ''}:${nested?.id || ''}`;
+}
+function dependencyDraft(task, nested) {
+  return crewDependencyDrafts[dependencyRowKey(task, nested)] || '';
+}
+function setCrewTaskDependencyDraft(task, nested, dependencyId) {
+  crewDependencyDrafts[dependencyRowKey(task, nested)] = dependencyId || '';
 }
 function addCrewTaskDependency(task, nested) {
-  const nestedIndex = (task.crew_tasks || []).findIndex(
-    (item) => item.id === nested.id,
-  );
-  const options = (task.crew_tasks || [])
-    .slice(0, Math.max(0, nestedIndex))
-    .filter((item) => !nested.depends_on.includes(item.id));
-  if (!options.length) return;
-  const dependency = options[options.length - 1];
-  nested.depends_on.push(dependency.id);
-  nested.dependency_variables ||= {};
-  nested.dependency_variables[dependency.id] = [
-    { source_variable: "result", target_variable: "context" },
-  ];
+  const key = dependencyRowKey(task, nested);
+  const dependencyId = dependencyDraft(task, nested);
+  if (!dependencyId || !availableCrewTaskDependencies(task, nested).some((item) => item.id === dependencyId)) return;
+  if (!nested.depends_on) nested.depends_on = [];
+  if (!nested.depends_on.includes(dependencyId) && !nestedDependencyWouldCycle(task, nested, dependencyId))
+    nested.depends_on.push(dependencyId);
+  crewDependencyDrafts[key] = '';
+  syncCrewOutputMode(task);
 }
-function updateCrewDependencySource(nested, dependencyId, sourceVariable) {
-  nested.dependency_variables ||= {};
-  const mappings = nested.dependency_variables[dependencyId] || [];
-  nested.dependency_variables[dependencyId] = [
-    {
-      source_variable: sourceVariable,
-      target_variable: mappings[0]?.target_variable || "context",
-    },
-  ];
-}
-function updateCrewDependencyTarget(nested, dependencyId, targetVariable) {
-  nested.dependency_variables ||= {};
-  const mappings = nested.dependency_variables[dependencyId] || [];
-  nested.dependency_variables[dependencyId] = [
-    {
-      source_variable: mappings[0]?.source_variable || "result",
-      target_variable:
-        targetVariable
-          .trim()
-          .replace(/[^A-Za-z0-9_]/g, "_")
-          .replace(/^[^A-Za-z_]+/, "") || "context",
-    },
-  ];
+function setCrewTaskDependency(task, nested, dependencyId) {
+  setCrewTaskDependencyDraft(task, nested, dependencyId);
 }
 function removeCrewTaskDependency(nested, dependencyId) {
   nested.depends_on = (nested.depends_on || []).filter(
     (id) => id !== dependencyId,
   );
-  if (nested.dependency_variables)
-    delete nested.dependency_variables[dependencyId];
-}
-function changeNodeType(type) {
-  const task = selectedTask.value;
-  if (!task || workflow.value.kind === "crew") return;
-  task.node_type = type;
-  if (type === "router") {
-    task.agent_id = null;
-    task.crew_agent_ids = [];
-    task.condition ||= "contains:approved";
-  } else if (type === "crew") {
-    task.agent_id = null;
-    task.crew_process ||= "sequential";
-    task.crew_agent_ids = task.crew_agent_ids?.length
-      ? task.crew_agent_ids
-      : workflow.value.agents.map((item) => item.id);
-    task.crew_tasks = task.crew_tasks?.length
-      ? task.crew_tasks
-      : [defaultCrewTask(task)];
-  } else {
-    task.agent_id ||= workflow.value.agents[0]?.id || addAgent();
-    task.crew_agent_ids = [];
-    task.crew_tasks = [];
-  }
+  const crew = workflow.value.tasks.find(task => (task.crew_tasks || []).some(item => item.id === nested.id));
+  if (crew) syncCrewOutputMode(crew);
 }
 function isValidConnection(connection) {
   if (restoringEdges) return true;
-  const { source, target } = connection;
+  const { source, target, sourceHandle } = connection;
   if (!source || !target || source === target || target.startsWith("agent:"))
     return false;
   const targetTask = workflow.value.tasks.find((item) => item.id === target);
@@ -2604,15 +3515,22 @@ function isValidConnection(connection) {
       agentId === workflow.value.manager_agent_id
     )
       return false;
+    if (workflow.value.kind === "flow") {
+      if (targetTask.node_type === "crew")
+        return !targetTask.crew_agent_ids.includes(agentId);
+      return !["router", "code", "tool"].includes(targetTask.node_type)
+        && !targetTask.agent_id;
+    }
     return targetTask.node_type === "crew"
       ? !targetTask.crew_agent_ids.includes(agentId)
-      : targetTask.node_type !== "router" && targetTask.agent_id !== agentId;
+      : !["router", "code", "tool"].includes(targetTask.node_type) && targetTask.agent_id !== agentId;
   }
-  if (
-    !workflow.value.tasks.some((item) => item.id === source) ||
-    targetTask.depends_on.includes(source)
-  )
+  const sourceTask = workflow.value.tasks.find((item) => item.id === source);
+  const branch = sourceHandle?.startsWith('route:') ? sourceHandle.slice(6) : '';
+  const duplicateBranch = branch && sourceTask?.routes?.[branch]?.includes(target);
+  if (!sourceTask || duplicateBranch || (!branch && targetTask.depends_on.includes(source)))
     return false;
+  if (branch && (sourceTask.node_type !== 'router' || !routerCases(sourceTask).some(item => item.id === branch))) return false;
   const stack = [target];
   const visited = new Set();
   while (stack.length) {
@@ -2636,118 +3554,33 @@ function connect(connection) {
   );
   if (connection.source.startsWith("agent:")) {
     const agentId = connection.source.slice(6);
-    if (target.node_type === "crew") target.crew_agent_ids.push(agentId);
-    else target.agent_id = agentId;
+    if (target.node_type === "crew") {
+      target.crew_agent_ids ||= [];
+      if (!target.crew_agent_ids.includes(agentId)) target.crew_agent_ids.push(agentId);
+      if (target.crew_process === 'hierarchical' && !target.crew_manager_agent_id &&
+          !target.crew_manager_model_profile_id) {
+        target.crew_manager_agent_id = target.crew_agent_ids[0] || null;
+      }
+      syncAgentDelegation();
+    } else {
+      target.agent_id = agentId;
+    }
   } else {
-    target.depends_on.push(connection.source);
-    const sourceName =
-      taskName(connection.source)
-        .toLowerCase()
-        .replace(/[^a-z0-9]+/g, "_")
-        .replace(/^_|_$/g, "") || "context";
-    const sourceVariable =
-      outputOptions(connection.source)[0]?.name || "result";
-    target.dependency_variables[connection.source] = [
-      { source_variable: sourceVariable, target_variable: sourceName },
-    ];
+    if (!target.depends_on.includes(connection.source)) target.depends_on.push(connection.source);
+    if (connection.sourceHandle?.startsWith('route:')) {
+      const branch = connection.sourceHandle.slice(6);
+      const source = workflow.value.tasks.find(item => item.id === connection.source);
+      source.routes ||= {};
+      source.routes[branch] ||= [];
+      if (!source.routes[branch].includes(target.id)) source.routes[branch].push(target.id);
+      return;
+    }
+    target.dependency_variables = {};
   }
 }
 
-function addVariableMapping(task, dependencyId) {
-  task.dependency_variables[dependencyId] ||= [];
-  const used = new Set(
-    task.dependency_variables[dependencyId].map((item) => item.source_variable),
-  );
-  const source =
-    outputOptions(dependencyId).find((item) => !used.has(item.name))?.name ||
-    outputOptions(dependencyId)[0]?.name ||
-    "result";
-  const base = source === "result" ? "context" : source;
-  let target = base;
-  let suffix = 2;
-  const targetNames = new Set(
-    Object.values(task.dependency_variables)
-      .flat()
-      .map((item) => item.target_variable),
-  );
-  while (targetNames.has(target)) target = `${base}_${suffix++}`;
-  task.dependency_variables[dependencyId].push({
-    source_variable: source,
-    target_variable: target,
-  });
-}
-function removeVariableMapping(task, dependencyId, index) {
-  task.dependency_variables[dependencyId].splice(index, 1);
-}
-function addOutputVariable(task) {
-  const used = new Set(task.output_variables.map((item) => item.name));
-  let name = "field";
-  let suffix = 2;
-  while (used.has(name)) name = `field_${suffix++}`;
-  task.output_variables.push({ name, description: "", value_type: "string" });
-}
-function renameOutputVariable(task, index, value) {
-  const previous = task.output_variables[index].name;
-  const name =
-    value
-      .trim()
-      .replace(/[^A-Za-z0-9_]/g, "_")
-      .replace(/^[^A-Za-z_]+/, "") || previous;
-  if (
-    task.output_variables.some(
-      (item, itemIndex) => itemIndex !== index && item.name === name,
-    )
-  ) {
-    store.error = "输出变量名不能重复";
-    return;
-  }
-  task.output_variables[index].name = name;
-  workflow.value.tasks.forEach((item) =>
-    (item.dependency_variables?.[task.id] || []).forEach((mapping) => {
-      if (mapping.source_variable === previous) mapping.source_variable = name;
-    }),
-  );
-}
-function renameCrewOutputVariable(task, index, value) {
-  const previous = task.output_variables[index].name;
-  const name =
-    value
-      .trim()
-      .replace(/[^A-Za-z0-9_]/g, "_")
-      .replace(/^[^A-Za-z_]+/, "") || previous;
-  if (
-    task.output_variables.some(
-      (item, itemIndex) => itemIndex !== index && item.name === name,
-    )
-  ) {
-    store.error = "内部任务输出变量名不能重复";
-    return;
-  }
-  task.output_variables[index].name = name;
-  workflow.value.tasks
-    .flatMap((item) => item.crew_tasks || [])
-    .forEach((item) => {
-      (item.dependency_variables?.[task.id] || []).forEach((mapping) => {
-        if (mapping.source_variable === previous)
-          mapping.source_variable = name;
-      });
-    });
-}
-function removeOutputVariable(task, index) {
-  if (task.output_variables.length === 1) {
-    store.error = "任务至少需要保留一个输出变量";
-    return;
-  }
-  const removed = task.output_variables[index].name;
-  task.output_variables.splice(index, 1);
-  workflow.value.tasks.forEach((item) => {
-    if (item.dependency_variables?.[task.id])
-      item.dependency_variables[task.id] = item.dependency_variables[
-        task.id
-      ].filter((mapping) => mapping.source_variable !== removed);
-  });
-}
 function nodeClick({ node }) {
+  inspectorSettingsOpen.value = false;
   selectedEdgeId.value = "";
   if (node.id.startsWith("agent:")) {
     selectedAgentId.value = node.id.slice(6);
@@ -2758,6 +3591,7 @@ function nodeClick({ node }) {
   }
 }
 function edgeClick({ edge }) {
+  inspectorSettingsOpen.value = false;
   selectedEdgeId.value = edge.id;
   selectedTaskId.value = "";
   selectedAgentId.value = "";
@@ -2777,33 +3611,75 @@ function clearSelection() {
   selectedTaskId.value = "";
   selectedAgentId.value = "";
   selectedEdgeId.value = "";
+  inspectorSettingsOpen.value = false;
+  canvasAddMenuOpen.value = false;
+}
+function toggleOrchestrationSettings() {
+  const settingsOnly = inspectorSettingsOpen.value &&
+    !selectedAgent.value && !selectedTask.value && !selectedEdge.value;
+  if (settingsOnly) {
+    inspectorSettingsOpen.value = false;
+    return;
+  }
+  selectedTaskId.value = "";
+  selectedAgentId.value = "";
+  selectedEdgeId.value = "";
+  canvasAddMenuOpen.value = false;
+  inspectorSettingsOpen.value = true;
 }
 function removeEdge() {
   const edge = selectedEdge.value;
   if (!edge) return;
   const target = workflow.value.tasks.find((item) => item.id === edge.target);
-  if (edge.edgeType === "dependency") {
+  if (edge.edgeType === 'route') {
+    const source = workflow.value.tasks.find(item => item.id === edge.source);
+    source.routes[edge.branch] = (source.routes[edge.branch] || []).filter(id => id !== edge.target);
+    const stillRouted = Object.values(source.routes).some(targets => targets.includes(edge.target));
+    if (!stillRouted) target.depends_on = target.depends_on.filter(id => id !== edge.source);
+  } else if (edge.edgeType === "dependency") {
     target.depends_on = target.depends_on.filter((id) => id !== edge.source);
-    delete target.dependency_variables[edge.source];
-  } else if (edge.edgeType === "member" && target.crew_agent_ids.length > 1) {
+    target.dependency_variables = {};
+    if (['code', 'tool'].includes(target.node_type) && !ancestorNodeIds(target).has(edge.source)) {
+      const bindings = removeDependencyBindings(target.input_bindings, edge.source);
+      target.input_bindings = bindings;
+      syncCodeSignature(target, bindings);
+    }
+  } else if (edge.edgeType === "member") {
+    if (workflow.value.kind === "crew" && target.crew_agent_ids.length === 1) {
+      store.error = "Crew kickoff 至少需要一个 Agent";
+      return;
+    }
     const removedAgent = edge.source.slice(6);
     target.crew_agent_ids = target.crew_agent_ids.filter(
       (id) => id !== removedAgent,
     );
+    if (target.crew_manager_agent_id === removedAgent) {
+      target.crew_manager_agent_id = target.crew_process === 'hierarchical'
+        ? target.crew_agent_ids[0] || null
+        : null;
+    }
     (target.crew_tasks || []).forEach((item) => {
       if (item.agent_id === removedAgent)
-        item.agent_id = target.crew_agent_ids[0] || null;
+        item.agent_id = null;
     });
+    syncAgentDelegation();
   } else {
-    store.error =
-      "执行节点必须保留 Agent。请在右侧分配其他 Agent，或删除整个节点。";
-    return;
+    // Assignment is represented by the edge. Removing it intentionally leaves
+    // the Flow step unassigned until another Agent edge is drawn.
+    target.agent_id = null;
   }
   selectedEdgeId.value = "";
 }
 function removeTask() {
   const task = selectedTask.value;
   if (!task) return;
+  workflow.value.tasks.forEach(item => {
+    if (item.node_type === 'router') {
+      Object.keys(item.routes || {}).forEach(branch => {
+        item.routes[branch] = item.routes[branch].filter(id => id !== task.id);
+      });
+    }
+  });
   workflow.value.tasks = workflow.value.tasks
     .filter((item) => item.id !== task.id)
     .map((item) => {
@@ -2966,10 +3842,7 @@ async function finishCapabilityConfiguration(message) {
       action: "confirm_capabilities",
     });
   } catch (error) {
-    answer.streaming = false;
-    answer.text ||= `没有完成：${error.message}`;
-    answer.role = "error";
-    store.error = error.message;
+    markStudioFailure(answer, error);
   } finally {
     busy.value = false;
     message.submitting = false;
@@ -3133,7 +4006,8 @@ function chooseStructure(kind) {
 </script>
 
 <template>
-  <div class="studio-page">
+  <div class="studio-page" :class="{ 'is-loading': pageLoading }">
+    <div v-if="pageLoading" class="studio-loading" role="status"><LoaderCircle class="spin" :size="26" /><span>正在加载编排…</span></div>
     <header class="studio-toolbar">
       <div class="studio-title">
         <GitBranch v-if="workflow.kind === 'flow'" :size="17" /><UsersRound
@@ -3151,7 +4025,7 @@ function chooseStructure(kind) {
         </button><span
           class="save-state"
           >{{ saveState }}</span
-        >
+        ><button class="icon-button assistant-toggle natural-language-trigger" type="button" title="自然语言编排" aria-label="打开自然语言编排" :aria-pressed="assistantOpen" @click="assistantOpen = !assistantOpen"><span class="natural-language-trigger-icon"><MessageCircle :size="16" /><Sparkles :size="9" /></span></button>
       </div>
       <div class="toolbar-right">
         <button v-if="!route.params.id" class="button" @click="startNewSession">
@@ -3168,6 +4042,15 @@ function chooseStructure(kind) {
               : "Auto"
           }}<LockKeyhole v-if="builderReady" :size="12"
         /></span>
+        <button
+          v-if="builderReady"
+          class="button orchestration-settings-button"
+          :class="{ active: inspectorSettingsOpen && !selectedAgent && !selectedTask && !selectedEdge }"
+          :aria-pressed="inspectorSettingsOpen && !selectedAgent && !selectedTask && !selectedEdge"
+          @click="toggleOrchestrationSettings"
+        >
+          <Settings2 :size="14" />编排设置
+        </button>
         <button class="button" @click="save"><Save :size="14" />保存</button
         ><button class="button" @click="publish">
           <Check :size="14" />{{
@@ -3185,12 +4068,24 @@ function chooseStructure(kind) {
       </div>
     </header>
 
-    <div class="studio-layout" :class="{ 'awaiting-structure': !builderReady }">
-      <aside class="studio-panel">
+    <div
+      class="studio-layout"
+      :class="{
+        'awaiting-structure': !builderReady,
+        'has-inspector': inspectorVisible,
+      }"
+    >
+      <aside v-show="assistantOpen" class="studio-panel studio-assistant-drawer">
         <div class="studio-panel-head">
-          <strong>Assistant</strong><Sparkles :size="14" />
+          <strong>自然语言编排</strong><button class="icon-button" type="button" title="收起自然语言编排" aria-label="收起自然语言编排" @click="assistantOpen = false"><X :size="16" /></button>
         </div>
-        <div ref="assistantThread" class="assistant-thread">
+        <div ref="assistantThread" class="assistant-thread" @scroll="onAssistantScroll">
+          <div v-if="historyLoading" class="assistant-history-loading" role="status">
+            正在加载更早的消息…
+          </div>
+          <div v-else-if="historyHasMore" class="assistant-history-hint">
+            上滑加载更早的消息
+          </div>
           <div
             v-for="(message, index) in messages"
             :key="index"
@@ -3220,6 +4115,19 @@ function chooseStructure(kind) {
               {{ pendingStageText(message) }}
             </div>
             <RichMessage class="message-copy" :text="message.text" :files="message.files || []" />
+            <div v-if="message.role === 'error' && message.error" class="assistant-error-actions">
+              <button
+                v-if="isRetryableStudioMessage(index)"
+                class="button ghost chat-error-retry"
+                type="button"
+                :disabled="busy || message.retrying"
+                @click="retryStudioMessage(message)"
+              >
+                <LoaderCircle v-if="message.retrying" class="spin" :size="13" />
+                <RotateCcw v-else :size="13" />
+                {{ message.retrying ? "正在重试…" : "重试此轮" }}
+              </button>
+            </div>
             <span v-if="message.streaming" class="stream-caret"></span>
 
             <section
@@ -3360,7 +4268,7 @@ function chooseStructure(kind) {
                     />
                   </div>
                   <div class="contract-input-options">
-                    <select v-model="item.input_type" :disabled="item.name === 'message' || proposalStageLocked(message.proposal, 'inputs')">
+                    <select v-model="item.input_type" @change="normalizeProposalInputType(item)" :disabled="item.name === 'message' || proposalStageLocked(message.proposal, 'inputs')">
                       <option value="text">短文本</option>
                       <option value="long_text">长文本</option>
                       <option value="file">文件</option>
@@ -3374,12 +4282,6 @@ function chooseStructure(kind) {
                         type="checkbox"
                         :disabled="item.name === 'message' || proposalStageLocked(message.proposal, 'inputs')"
                       />必填</label
-                    ><label v-if="['file', 'image'].includes(item.input_type)"
-                      ><input
-                        v-model="item.multiple"
-                        type="checkbox"
-                        :disabled="proposalStageLocked(message.proposal, 'inputs')"
-                      />多文件</label
                     ><button
                       v-if="item.name !== 'message' && !proposalStageLocked(message.proposal, 'inputs')"
                       class="icon-button"
@@ -3421,7 +4323,7 @@ function chooseStructure(kind) {
                       :disabled="!isActiveProposal(index) || message.submitting"
                       @click="setProposalKind(message.proposal, 'flow')"
                     >
-                      <GitBranch :size="15" /><strong>Flow</strong><small>状态、分支或事件驱动</small>
+                      <GitBranch :size="15" /><strong>Flow</strong><small>状态、分支与确定性节点</small>
                     </button>
                   </div>
                   <p v-if="!message.proposal.kind_preselected" class="proposal-kind-note">确认后才会锁定类型并生成最终节点。</p>
@@ -3539,7 +4441,7 @@ function chooseStructure(kind) {
         </div>
         <div v-if="!store.chatModels.length" class="model-required">
           <span><Cpu :size="18" /></span><strong>需要模型连接</strong>
-          <p>添加至少一个模型后，才能与 Studio Assistant 对话或生成编排。</p>
+          <p>添加至少一个模型后，才能通过自然语言生成或调整编排。</p>
           <button class="button accent" @click="router.push('/models')">
             添加模型
           </button>
@@ -3675,11 +4577,7 @@ function chooseStructure(kind) {
                 class="studio-history-item"
                 @click="openHistoryProject(item)"
               >
-                <span class="studio-history-icon"
-                  ><GitBranch
-                    v-if="item.kind === 'flow'"
-                    :size="15" /><UsersRound v-else :size="15"
-                /></span>
+                <span class="studio-history-icon"><GitBranch v-if="item.kind === 'flow'" :size="15" /><UsersRound v-else :size="15" /></span>
                 <div>
                   <strong>{{ item.name }}</strong>
                   <p>{{ short(item.description, 64) }}</p>
@@ -3754,7 +4652,7 @@ function chooseStructure(kind) {
                 type="target"
                 :position="Position.Left"
               /><Handle
-                v-if="data.task.node_type !== 'router'"
+                v-if="!['router','code','tool'].includes(data.task.node_type)"
                 id="agent-in"
                 type="target"
                 :position="Position.Top"
@@ -3778,10 +4676,38 @@ function chooseStructure(kind) {
                 <strong>{{ data.task.name }}</strong>
                 <p>{{ short(data.task.description) }}</p>
               </div>
+              <div v-if="data.task.node_type === 'router'" class="router-branch-ports">
+                <div v-for="(branch, index) in routerCases(data.task)" :key="branch.id" class="router-branch-port">
+                  <div class="router-branch-main"><span>{{ branch.label }}</span><small>{{ data.task.routes?.[branch.id]?.length || 0 }} 个下游</small></div>
+                  <small class="router-branch-summary" :title="branch.summary">{{ short(branch.summary, 54) }}</small>
+                  <Handle
+                    :id="`route:${branch.id}`" type="source" :position="Position.Right"
+                    :style="{ right: '-7px' }"
+                  />
+                </div>
+              </div>
+              <div v-if="data.task.node_type !== 'router'" class="flow-node-contract">
+                <span class="flow-node-contract-label">固定输出</span>
+                <span
+                  v-for="field in (data.task.output_variables?.length
+                    ? data.task.output_variables
+                    : fixedOutputVariables(data.task.node_type))"
+                  :key="field.name"
+                  class="flow-node-output-chip"
+                  :title="field.description || field.name"
+                >
+                  <code>{{ field.name }}</code>
+                  <small>{{ field.value_type }}</small>
+                </span>
+              </div>
               <div class="flow-node-agent">
                 <span class="agent-dot"
                   ><UserRound v-if="data.agent" :size="13" /><Route
                     v-else-if="data.task.node_type === 'router'"
+                    :size="13" /><Cpu
+                    v-else-if="data.task.node_type === 'code'"
+                    :size="13" /><Wrench
+                    v-else-if="data.task.node_type === 'tool'"
                     :size="13" /><UsersRound v-else :size="13"
                 /></span>
                 <div>
@@ -3789,23 +4715,54 @@ function chooseStructure(kind) {
                     data.agent?.role ||
                     (data.task.node_type === "router"
                       ? "Deterministic condition"
-                      : `${data.task.crew_agent_ids.length} Crew members`)
+                      : data.task.node_type === "code"
+                        ? "Python code"
+                        : data.task.node_type === "tool"
+                          ? "Tool call"
+                          : `${data.task.crew_agent_ids.length} Crew members`)
                   }}</b
                   ><small>{{
                     data.task.node_type === "router"
                       ? data.task.condition
+                      : data.task.node_type === "code"
+                        ? "main(...)"
+                        : data.task.node_type === "tool"
+                          ? (data.task.tool_id ? "已配置工具" : "未选择工具")
                       : data.model
                   }}</small>
                 </div>
               </div>
-              <Handle
+              <Handle v-if="data.task.node_type !== 'router'"
                 id="context-out"
                 type="source"
                 :position="Position.Right"
               /></div
           ></template>
           <Panel position="top-left" class="canvas-toolbar"
-            ><button class="icon-button" title="缩小" @click="zoomOut()">
+            ><div class="canvas-add-menu" @click.stop>
+              <button
+                class="icon-button canvas-add-trigger"
+                title="添加节点"
+                aria-label="添加节点"
+                :aria-expanded="canvasAddMenuOpen"
+                @click="canvasAddMenuOpen = !canvasAddMenuOpen"
+              ><Plus :size="16" /></button>
+              <div v-if="canvasAddMenuOpen" class="canvas-add-popover">
+                <strong>添加节点</strong>
+                <template v-if="workflow.kind === 'flow'">
+                  <button type="button" @click="addCanvasNode('agent-definition')"><Bot :size="14" />Agent 定义</button>
+                  <button type="button" @click="addCanvasNode('agent')"><Bot :size="14" />单 Agent</button>
+                  <button type="button" @click="addCanvasNode('crew')"><UsersRound :size="14" />Crew</button>
+                  <button type="button" @click="addCanvasNode('router')"><Route :size="14" />条件路由</button>
+                  <button type="button" @click="addCanvasNode('code')"><Cpu :size="14" />代码</button>
+                  <button type="button" @click="addCanvasNode('tool')"><Wrench :size="14" />工具</button>
+                </template>
+                <template v-else>
+                  <button type="button" @click="addCanvasNode('agent-definition')"><Bot :size="14" />Agent 定义</button>
+                  <button type="button" @click="addCanvasNode('task')"><ListTodo :size="14" />Task</button>
+                </template>
+              </div>
+            </div><button class="icon-button" title="缩小" @click="zoomOut()">
               <ZoomOut :size="14" /></button
             ><button class="icon-button" title="放大" @click="zoomIn()">
               <ZoomIn :size="14" /></button
@@ -3853,49 +4810,13 @@ function chooseStructure(kind) {
             v-if="selectedAgent || selectedTask || selectedEdge"
             class="key-hint"
             >Delete</span
-          >
-        </div>
-        <div class="studio-quick-add">
-          <template v-if="!builderReady"
-            ><button class="button small" @click="chooseStructure('flow')">
-              <GitBranch :size="12" />Flow</button
-            ><button class="button small" @click="chooseStructure('crew')">
-              <UsersRound :size="12" />Crew
-            </button></template
-          ><template v-else
-            ><button
-              class="button small"
-              title="添加 Agent 定义"
-              @click="addAgent"
-            >
-              <Plus :size="12" />Agent</button
-            ><button
-              v-if="workflow.kind === 'crew'"
-              class="button small"
-              title="添加 Crew Task"
-              @click="addStep('task')"
-            >
-              <Plus :size="12" />Task</button
-            ><template v-else
-              ><button
-                class="button small"
-                title="添加 Agent call"
-                @click="addStep('agent')"
-              >
-                <Bot :size="12" />Call</button
-              ><button
-                class="button small"
-                title="添加 Crew kickoff"
-                @click="addStep('crew')"
-              >
-                <UsersRound :size="12" />Crew</button
-              ><button
-                class="icon-button"
-                title="添加 Router"
-                @click="addStep('router')"
-              >
-                <Route :size="13" /></button></template
-          ></template>
+          ><button
+            class="icon-button studio-inspector-close"
+            type="button"
+            title="关闭属性面板"
+            aria-label="关闭属性面板"
+            @click="clearSelection"
+          ><X :size="14" /></button>
         </div>
         <div v-if="selectedAgent" class="studio-panel-scroll">
           <section class="inspector-section">
@@ -3912,14 +4833,14 @@ function chooseStructure(kind) {
                 ><ParamLabel
                   text="目标（goal）"
                   help="Agent 需要完成的长期目标；应能指导每次任务决策。" /></label
-              ><textarea v-model="selectedAgent.goal"></textarea>
+              ><VariableTextarea v-model="selectedAgent.goal" :variables="runInputOptions" />
             </div>
             <div class="field">
               <label
                 ><ParamLabel
                   text="背景（backstory）"
                   help="提供专业背景和工作边界，帮助模型稳定地扮演角色。" /></label
-              ><textarea v-model="selectedAgent.backstory"></textarea>
+              ><VariableTextarea v-model="selectedAgent.backstory" :variables="runInputOptions" />
             </div>
             <div class="field">
               <label
@@ -3989,7 +4910,9 @@ function chooseStructure(kind) {
               ><input
                 v-model="selectedAgent.allow_delegation"
                 type="checkbox"
+                :disabled="!selectedAgentCanDelegate"
                 class="toggle" /></label
+            ><small v-if="!selectedAgentCanDelegate" class="field-help-text">仅层级 Crew 的管理 Agent 可开启。</small
             ><label class="toggle-row"
               ><span
                 >压缩长上下文（respect_context_window）<button
@@ -4195,21 +5118,15 @@ function chooseStructure(kind) {
             v-if="selectedTask.node_type === 'crew'"
             class="inspector-section embedded-crew-process"
           >
-            <div class="field">
-              <label
-                ><ParamLabel
-                  text="Crew 执行方式（crew_process）"
-                  help="Flow 本身由事件驱动；这里决定嵌入 Crew 内部是按顺序执行，还是由 manager_llm 动态分配任务。" /></label
-              ><select
-                :value="selectedTask.crew_process"
-                @change="changeEmbeddedCrewProcess(selectedTask, $event.target.value)"
-              >
-                <option value="sequential">顺序协作（sequential）</option>
-                <option value="hierarchical">
-                  层级协作（hierarchical）
-                </option></select
-              ><small>层级模式使用成员列表中的第一个 Agent 作为管理 Agent。</small>
-            </div>
+            <CrewSettingsEditor
+              :model-value="selectedTask"
+              prefix="crew_"
+              :agents="workflow.agents.filter((agent) => (selectedTask.crew_agent_ids || []).includes(agent.id))"
+              :models="store.chatModels"
+              title="Crew 节点设置"
+              @process-change="changeEmbeddedCrewProcess(selectedTask, $event)"
+              @manager-change="changeEmbeddedCrewManager(selectedTask, $event)"
+            />
           </section>
           <section class="inspector-section">
             <h3>
@@ -4223,24 +5140,9 @@ function chooseStructure(kind) {
               <label
                 ><ParamLabel
                   text="节点类型（node_type）"
-                  help="agent：调用一个 Agent；crew：在 Flow 中启动一个多任务 Crew；router：只做确定性分支。" /></label
-              ><select
-                :value="selectedTask.node_type"
-                :disabled="workflow.kind === 'crew'"
-                @change="changeNodeType($event.target.value)"
-              >
-                <option v-if="workflow.kind === 'crew'" value="task">
-                  Crew 任务（task）
-                </option>
-                <template v-else
-                  ><option value="agent">单 Agent 调用（agent_call）</option>
-                  <option value="crew">Crew 协作（crew）</option>
-                  <option value="router">条件路由（router）</option>
-                  <option v-if="selectedTask.node_type === 'code'" value="code">
-                    代码方法（code）
-                  </option></template
-                >
-              </select>
+                  help="agent：调用一个已连线的 Agent；crew：调用由多个已连线 Agent 组成的 Crew；router：只做确定性分支；code/tool：直接执行确定性步骤。" /></label
+              ><div class="tag">{{ typeInfo[selectedTask.node_type]?.label || '任务' }}</div>
+              <small>类型在创建节点时确定；需要其他类型时请新增节点。</small>
             </div>
             <div class="field">
               <label>名称（name）</label
@@ -4248,34 +5150,90 @@ function chooseStructure(kind) {
                 v-model="selectedTask.name"
               />
             </div>
-            <div class="field">
+            <div v-if="!['code', 'tool'].includes(selectedTask.node_type)" class="field">
               <label
                 ><ParamLabel
                   text="任务描述（description）"
                   help="告诉 Agent 要做什么；可以使用已声明的运行输入变量，例如 {contract_file}。" /></label
-              ><textarea
-                v-model="selectedTask.description"
-              ></textarea>
+              ><VariableTextarea v-model="selectedTask.description" :variables="taskVariableOptions" />
             </div>
-            <div v-if="selectedTask.node_type !== 'router'" class="field">
+            <section v-if="selectedTask.node_type === 'tool'" class="node-execution-card tool-node-editor">
+              <header class="node-editor-title">
+                <div><span class="node-editor-kicker">TOOL INPUT</span><h4>选择已注册工具</h4></div>
+                <Wrench :size="16" />
+              </header>
+              <div class="field">
+                <label>执行工具（tool_id）</label>
+                <select :value="selectedTask.tool_id || ''" @change="selectFlowTool(selectedTask, $event.target.value)">
+                  <option value="">选择工作空间中的工具</option>
+                  <option v-for="tool in flowTools" :key="tool.id" :value="String(tool.id)">{{ tool.name }} · {{ tool.kind }}</option>
+                </select>
+              </div>
+              <div v-if="selectedFlowTool" class="selected-tool-summary">
+                <div class="selected-tool-icon"><Wrench :size="15" /></div>
+                <div><strong>{{ selectedFlowTool.name }}</strong><small>{{ selectedFlowTool.description || '已注册工具' }}</small></div>
+              </div>
+              <p v-if="!flowTools.length" class="node-editor-empty">工作空间还没有工具。请先在资源中心创建工具，再回到这里选择。</p>
+              <p v-else-if="!selectedFlowTool" class="node-editor-empty">选择工具后，输入参数会按照该工具的 schema 自动生成。</p>
+              <NodeInputBindings
+                v-if="selectedFlowTool"
+                :model-value="selectedTask.input_bindings"
+                @update:model-value="updateDeterministicBindings(selectedTask, $event)"
+                title="工具输入参数"
+                :schema="selectedToolInputSchema"
+                :variables="selectedNodeVariableOptions"
+                locked
+              />
+            </section>
+            <section v-else-if="selectedTask.node_type === 'code'" class="node-execution-card code-node-editor">
+              <header class="node-editor-title">
+                <div><span class="node-editor-kicker">CODE INPUT</span><h4>定义可复用的代码步骤</h4></div>
+                <Cpu :size="16" />
+              </header>
+              <NodeInputBindings
+                :model-value="selectedTask.input_bindings"
+                @update:model-value="updateDeterministicBindings(selectedTask, $event)"
+                title="代码输入参数"
+                description="参数由 Python main(...) 签名决定；来源统一为变量或固定值，变量可选运行输入和所有前置节点输出。"
+                :schema="selectedCodeInputSchema"
+                :variables="selectedNodeVariableOptions"
+                editable-schema
+              />
+              <div class="field code-editor-field">
+                <label>Python 代码（code_snippet）</label>
+                <CodeEditor v-model="selectedTask.code_snippet" language="python" min-height="220px" placeholder='def main(message):\n    return {"text": message}' />
+                <small>只定义 <code>main(显式参数)</code> 并返回对象；输入列表会从签名同步，平台统一包装为 <code>{"output": 返回对象}</code>。不要在代码里读取外部路径。</small>
+              </div>
+            </section>
+            <div v-if="!['router', 'code', 'tool'].includes(selectedTask.node_type)" class="field">
               <label
                 ><ParamLabel
                   text="期望输出（expected_output）"
-                  help="定义完成标准和输出形态，CrewAI 会用它判断任务是否完成。" /></label
-              ><textarea
-                v-model="selectedTask.expected_output"
-              ></textarea>
+                  help="CrewAI 将它写入任务提示，用于指导 object 与 text 的内容；平台会校验固定 JSON 外层结构。" /></label
+              ><VariableTextarea v-model="selectedTask.expected_output" :variables="taskVariableOptions" />
             </div>
-            <div v-if="selectedTask.node_type === 'router'" class="field">
-              <label
-                ><ParamLabel
-                  text="条件（condition）"
-                  help="使用 contains:关键词、equals:文本 或 always 等安全规则，不执行任意 Python。" /></label
-              ><input
-                v-model="selectedTask.condition"
-                placeholder="contains:approved"
-              />
-            </div>
+            <section v-if="selectedTask.node_type === 'router'" class="router-rules-editor">
+              <div class="router-section-title"><h3>条件分支</h3><small>按顺序检查，命中第一个条件后只执行对应分支。</small></div>
+              <article v-for="(rule, index) in selectedTask.router_rules" :key="rule.id" class="router-case-editor">
+                <header class="router-case-heading">
+                  <div><strong>{{ index === 0 ? 'IF' : 'ELIF' }}</strong><small>CASE {{ index + 1 }}</small></div>
+                  <button v-if="index > 0" class="icon-button" type="button" title="删除此分支" @click="removeRouterRule(selectedTask, index)"><Trash2 :size="13" /></button>
+                </header>
+                <ConditionGroupEditor
+                  :model-value="rule.expression"
+                  :variables="selectedConditionVariableOptions"
+                  root
+                  @update:model-value="updateRouterRule(selectedTask, index, $event)"
+                />
+              </article>
+              <div v-if="!selectedTask.router_rules.length" class="field">
+                <label>旧版路由表达式（兼容）</label>
+                <input v-model="selectedTask.condition" placeholder="contains:approved" />
+                <small>新建 IF 条件后，将改用可视化条件规则。</small>
+              </div>
+              <button class="router-add-case" type="button" @click="addRouterRule(selectedTask)"><Plus :size="14" />{{ selectedTask.router_rules.length ? 'ELIF' : '添加 IF' }}</button>
+              <div class="router-else-note"><strong>ELSE</strong><span>以上条件都不满足时，执行 ELSE 连线指定的节点。</span></div>
+            </section>
             <div v-if="decisionOptions.length" class="field">
               <label>运行条件（run_if）</label
               ><select v-model="selectedTask.run_if">
@@ -4290,70 +5248,26 @@ function chooseStructure(kind) {
               </select>
             </div>
           </section>
-          <section
-            v-if="selectedTask.depends_on.length"
-            class="inspector-section variable-section"
-          >
-            <h3>输入变量映射（dependency_variables）</h3>
-            <div
-              v-for="dependency in selectedTask.depends_on"
-              :key="dependency"
-              class="variable-group"
-            >
+          <section v-if="upstreamTasks(selectedTask).length" class="inspector-section variable-section">
+            <h3>可用上游变量</h3>
+            <div v-for="upstream in upstreamTasks(selectedTask)" :key="upstream.id" class="variable-group">
               <div class="variable-group-head">
-                <span>{{ taskName(dependency) }}</span
-                ><button
-                  class="icon-button"
-                  title="添加变量映射"
-                  @click="addVariableMapping(selectedTask, dependency)"
-                >
-                  <Plus :size="12" />
-                </button>
+                <span>{{ upstream.name }}（{{ upstream.id }}）</span>
               </div>
-              <div
-                v-for="(mapping, index) in selectedTask.dependency_variables[
-                  dependency
-                ]"
-                :key="index"
-                class="variable-mapping-row"
-              >
-                <select
-                  v-model="mapping.source_variable"
-                  aria-label="上游输出变量"
-                >
-                  <option value="$raw">完整输出</option>
-                  <option
-                    v-for="field in outputOptions(dependency)"
-                    :key="field.name"
-                    :value="field.name"
-                  >
-                    {{ field.name }}
-                  </option>
-                </select>
-                <span>→</span
-                ><input
-                  v-model="mapping.target_variable"
-                  aria-label="下游输入变量"
-                  placeholder="variable_name"
-                />
-                <button
-                  class="icon-button"
-                  title="删除变量映射"
-                  @click="
-                    removeVariableMapping(selectedTask, dependency, index)
-                  "
-                >
-                  <Trash2 :size="12" />
-                </button>
+              <div class="fixed-output-list">
+                <span v-for="field in upstream.output_variables || []" :key="field.name" class="upstream-variable">
+                  <code>{{ field.name }}</code>
+                  <span class="upstream-variable-type">{{ field.value_type }}</span>
+                  <small>{{ field.description }}</small>
+                </span>
               </div>
-              <p v-if="!selectedTask.dependency_variables[dependency]?.length">
-                未选择字段时，仍会传递完整 Task context。
-              </p>
             </div>
           </section>
           <section
             v-if="
-              selectedTask.node_type !== 'router' &&
+              workflow.kind === 'crew' &&
+              workflow.process !== 'hierarchical' &&
+              !['router','code','tool'].includes(selectedTask.node_type) &&
               selectedTask.node_type !== 'crew'
             "
             class="inspector-section"
@@ -4379,7 +5293,7 @@ function chooseStructure(kind) {
                 >
                   {{ agent.role }}
                 </option></select
-              ><small>也可以从 Agent 节点下方端口连接到任务顶部。</small>
+              ><small>Flow 节点通过 Agent 节点连线指定；Crew 任务在这里选择执行 Agent。</small>
             </div>
           </section>
           <section
@@ -4387,34 +5301,48 @@ function chooseStructure(kind) {
             class="inspector-section"
           >
             <h3>Crew 成员（crew_agent_ids）</h3>
-            <label
-              v-for="agent in workflow.agents"
-              :key="agent.id"
-              class="toggle-row"
-              ><span>{{ agent.role }}</span
-              ><input
-                :checked="selectedTask.crew_agent_ids.includes(agent.id)"
-                type="checkbox"
-                @click.prevent="toggleCrewMember(agent.id)"
-            /></label>
-            <div class="field">
-              <label
-                ><ParamLabel
-                  text="默认执行 Agent（agent_id）"
-                  help="内部任务没有单独选择 Agent 时使用；留空则使用第一个 Crew 成员。" /></label
-              ><select v-model="selectedTask.agent_id">
-                <option :value="null">第一个成员（first_member）</option>
-                <option
-                  v-for="agent in workflow.agents.filter((item) =>
-                    selectedTask.crew_agent_ids.includes(item.id),
-                  )"
+            <template v-if="workflow.kind === 'flow'">
+              <div v-if="selectedTask.crew_agent_ids.length" class="connected-agent-list">
+                <span
+                  v-for="agent in workflow.agents.filter((item) => selectedTask.crew_agent_ids.includes(item.id))"
                   :key="agent.id"
-                  :value="agent.id"
-                >
-                  {{ agent.role }}
-                </option>
-              </select>
-            </div>
+                  class="connected-agent-chip"
+                ><UserRound :size="12" />{{ agent.role }}</span>
+              </div>
+              <p class="inspector-hint">Flow Crew 成员只由画布上的 Agent→Crew 连线决定；内部 Task 只能选择这些已连接成员。</p>
+            </template>
+            <template v-else>
+              <label
+                v-for="agent in workflow.agents"
+                :key="agent.id"
+                class="toggle-row"
+                ><span><UserRound :size="12" />{{ agent.role }}</span
+                ><input
+                  :checked="selectedTask.crew_agent_ids.includes(agent.id)"
+                  type="checkbox"
+                  @click.prevent="toggleCrewMember(agent.id)"
+              /></label>
+            </template>
+            <template v-if="workflow.kind === 'crew'">
+              <div class="field">
+                <label
+                  ><ParamLabel
+                    text="默认执行 Agent（agent_id）"
+                    help="内部任务没有单独选择 Agent 时使用；留空则使用第一个 Crew 成员。" /></label
+                ><select v-model="selectedTask.agent_id">
+                  <option :value="null">第一个成员（first_member）</option>
+                  <option
+                    v-for="agent in workflow.agents.filter((item) =>
+                      selectedTask.crew_agent_ids.includes(item.id),
+                    )"
+                    :key="agent.id"
+                    :value="agent.id"
+                  >
+                    {{ agent.role }}
+                  </option>
+                </select>
+              </div>
+            </template>
           </section>
           <section
             v-if="selectedTask.node_type === 'crew'"
@@ -4453,16 +5381,16 @@ function chooseStructure(kind) {
               </header>
               <div class="field">
                 <label>描述（description）</label
-                ><textarea v-model="nested.description"></textarea>
+                ><VariableTextarea v-model="nested.description" :variables="nestedVariableOptions(nested)" />
               </div>
               <div class="field">
                 <label>期望输出（expected_output）</label
-                ><textarea v-model="nested.expected_output"></textarea>
+                ><VariableTextarea v-model="nested.expected_output" :variables="nestedVariableOptions(nested)" />
               </div>
-              <div class="field">
+              <div v-if="workflow.kind === 'flow' && selectedTask.crew_process !== 'hierarchical'" class="field">
                 <label>执行 Agent（agent_id）</label
                 ><select v-model="nested.agent_id">
-                  <option :value="null">默认执行 Agent（default）</option>
+                  <option v-if="workflow.kind === 'crew'" :value="null">默认执行 Agent（default）</option>
                   <option
                     v-for="agent in workflow.agents.filter((item) =>
                       selectedTask.crew_agent_ids.includes(item.id),
@@ -4480,13 +5408,26 @@ function chooseStructure(kind) {
                     ><ParamLabel
                       text="依赖任务（depends_on）"
                       help="依赖会传入 CrewAI Task.context，并决定内部任务的执行顺序。" /></label
-                  ><button
-                    class="icon-button"
-                    title="添加内部任务依赖"
-                    @click="addCrewTaskDependency(selectedTask, nested)"
+                  ><select
+                    class="crew-dependency-select"
+                    :value="dependencyDraft(selectedTask, nested)"
+                    aria-label="选择上游内部任务"
+                    @change="setCrewTaskDependency(selectedTask, nested, $event.target.value)"
                   >
-                    <Plus :size="11" />
-                  </button>
+                    <option value="">选择上游任务</option>
+                    <option
+                      v-for="dependency in availableCrewTaskDependencies(selectedTask, nested)"
+                      :key="dependency.id"
+                      :value="dependency.id"
+                      :disabled="(nested.depends_on || []).includes(dependency.id)"
+                    >
+                      {{ dependency.name }}（{{ dependency.id }}）
+                    </option>
+                  </select><button
+                    class="icon-button"
+                    title="添加依赖任务"
+                    @click="addCrewTaskDependency(selectedTask, nested)"
+                  ><Plus :size="11" /></button>
                 </div>
                 <span v-for="dependency in nested.depends_on" :key="dependency"
                   >{{
@@ -4501,52 +5442,25 @@ function chooseStructure(kind) {
                 ></span>
               </div>
               <div class="nested-output-variables">
-                <div class="section-title-action">
-                  <label>输出变量（output_variables）</label
-                  ><button
-                    class="icon-button"
-                    title="添加内部任务输出变量"
-                    @click="addOutputVariable(nested)"
-                  >
-                    <Plus :size="11" />
-                  </button>
-                </div>
+                <label class="toggle-row"><span>结构化 JSON</span>
+                  <input v-model="nested.output_mode" @change="nested.output_mode === 'json' && (nested.markdown = false); syncCrewOutputMode(selectedTask)" type="checkbox" class="toggle" true-value="json" false-value="text" />
+                </label>
+                <label>固定输出变量</label>
                 <div
-                  v-for="(field, fieldIndex) in nested.output_variables"
-                  :key="fieldIndex"
-                  class="output-variable-row"
+                  v-for="field in nested.output_variables || []"
+                  :key="field.name"
+                  class="fixed-output-row"
                 >
-                  <input
-                    v-model="field.name"
-                    aria-label="变量名（name）"
-                  /><select
-                    v-model="field.value_type"
-                    aria-label="变量类型（value_type）"
-                  >
-                    <option value="string">文本（string）</option>
-                    <option value="number">数字（number）</option>
-                    <option value="boolean">布尔（boolean）</option>
-                    <option value="object">对象（object）</option>
-                    <option value="array">数组（array）</option>
-                    <option value="file">文件（file）</option></select
-                  ><input
-                    v-model="field.description"
-                    class="variable-description"
-                    aria-label="变量说明（description）"
-                    placeholder="字段说明"
-                  /><button
-                    class="icon-button"
-                    title="删除输出变量"
-                    @click="removeOutputVariable(nested, fieldIndex)"
-                  >
-                    <Trash2 :size="11" />
-                  </button>
+                  <code>{{ field.name }}</code>
+                  <span>{{ field.value_type }}</span>
+                  <small>{{ field.description }}</small>
                 </div>
               </div>
               <div class="crew-task-options">
                 <label
                   ><input
                     v-model="nested.markdown"
+                    :disabled="nested.output_mode === 'json'"
                     type="checkbox"
                   />Markdown（markdown）</label
                 ><label
@@ -4556,95 +5470,41 @@ function chooseStructure(kind) {
                   />异步（async_execution）</label
                 >
               </div>
-              <div class="field">
-                <label
-                  ><ParamLabel
-                    text="校验函数（guardrail）"
-                    help="Python callable 路径，例如 package.module:validate；运行环境必须能导入。" /></label
-                ><input
-                  v-model="nested.guardrail"
-                  placeholder="package.module:validate"
-                />
-              </div>
-              <div v-if="nested.guardrail" class="field">
-                <label>校验重试次数（guardrail_max_retries）</label
-                ><input
-                  v-model.number="nested.guardrail_max_retries"
-                  type="number"
-                  min="0"
-                  max="20"
-                />
-              </div>
             </article>
           </section>
-          <section
-            v-if="selectedTask.node_type !== 'router'"
-            class="inspector-section variable-section"
-          >
-            <div class="section-title-action">
-              <h3>输出变量（output_variables）</h3>
-              <button
-                class="icon-button"
-                title="添加输出变量"
-                @click="addOutputVariable(selectedTask)"
-              >
-                <Plus :size="12" />
-              </button>
+          <section v-if="selectedTask.node_type !== 'router'" class="inspector-section variable-section">
+            <div v-if="['task', 'agent'].includes(selectedTask.node_type)" class="output-mode-control">
+              <label class="toggle-row"><span>结构化 JSON</span>
+                <input v-model="selectedTask.output_mode" @change="selectedTask.output_mode === 'json' && (selectedTask.markdown = false)" type="checkbox" class="toggle" true-value="json" false-value="text" />
+              </label>
+              <small>开启后按期望输出生成结构化数据；关闭时直接返回正文。</small>
             </div>
-            <p>下游连线可选择这些字段。多个字段会启用 CrewAI 结构化输出。</p>
-            <div
-              v-for="(field, index) in selectedTask.output_variables"
-              :key="index"
-              class="output-variable-row"
-            >
-              <input
-                :value="field.name"
-                aria-label="输出变量名（name）"
-                @change="
-                  renameOutputVariable(selectedTask, index, $event.target.value)
-                "
-              /><select
-                v-model="field.value_type"
-                aria-label="输出变量类型（value_type）"
-              >
-                <option value="string">文本（string）</option>
-                <option value="number">数字（number）</option>
-                <option value="boolean">布尔（boolean）</option>
-                <option value="object">对象（object）</option>
-                <option value="array">数组（array）</option>
-                <option value="file">文件（file）</option></select
-              ><input
-                v-model="field.description"
-                class="variable-description"
-                aria-label="输出变量说明（description）"
-                placeholder="字段说明（description）"
-              /><button
-                class="icon-button"
-                title="删除输出变量"
-                @click="removeOutputVariable(selectedTask, index)"
-              >
-                <Trash2 :size="12" />
-              </button>
+            <h3>固定输出变量</h3>
+            <div v-for="field in selectedTask.output_variables || []" :key="field.name" class="fixed-output-row">
+              <code>{{ field.name }}</code>
+              <span>{{ field.value_type }}</span>
+              <small>{{ field.description }}</small>
             </div>
           </section>
           <section
-            v-if="selectedTask.node_type !== 'router'"
+            v-if="['task', 'agent', 'crew'].includes(selectedTask.node_type)"
             class="inspector-section"
           >
             <h3>
               {{
                 workflow.kind === "flow"
-                  ? "输出与审核（output_review）"
-                  : "输出设置（output）"
+                  ? "执行与人工审核"
+                  : "任务执行设置"
               }}
             </h3>
-            <label class="toggle-row"
+            <label v-if="['task', 'agent'].includes(selectedTask.node_type)" class="toggle-row"
               ><span>Markdown 输出（markdown）</span
               ><input
                 v-model="selectedTask.markdown"
+                :disabled="selectedTask.output_mode === 'json'"
                 type="checkbox"
                 class="toggle" /></label
-            ><label class="toggle-row"
+            ><label v-if="['task', 'agent'].includes(selectedTask.node_type)" class="toggle-row"
               ><span
                 >异步执行（async_execution）<button
                   class="field-help"
@@ -4657,7 +5517,7 @@ function chooseStructure(kind) {
                 v-model="selectedTask.async_execution"
                 type="checkbox"
                 class="toggle" /></label
-            ><label v-if="workflow.kind === 'flow'" class="toggle-row"
+            ><label v-if="workflow.kind === 'flow' && ['agent', 'crew'].includes(selectedTask.node_type)" class="toggle-row"
               ><span
                 >人工审批门（human_feedback）<button
                   class="field-help"
@@ -4671,7 +5531,7 @@ function chooseStructure(kind) {
                 type="checkbox"
                 class="toggle" /></label
             ><template
-              v-if="workflow.kind === 'flow' && selectedTask.human_feedback"
+              v-if="workflow.kind === 'flow' && ['agent', 'crew'].includes(selectedTask.node_type) && selectedTask.human_feedback"
               ><div class="field">
                 <label>审核消息（feedback_message）</label
                 ><input v-model="selectedTask.feedback_message" />
@@ -4702,25 +5562,6 @@ function chooseStructure(kind) {
                 </select>
               </div></template
             >
-            <div class="field">
-              <label
-                ><ParamLabel
-                  text="校验函数（guardrail）"
-                  help="Python callable 路径，例如 package.module:validate。" /></label
-              ><input
-                v-model="selectedTask.guardrail"
-                placeholder="package.module:validate"
-              />
-            </div>
-            <div v-if="selectedTask.guardrail" class="field">
-              <label>校验重试次数（guardrail_max_retries）</label
-              ><input
-                v-model.number="selectedTask.guardrail_max_retries"
-                type="number"
-                min="0"
-                max="20"
-              />
-            </div>
           </section>
           <button class="button danger" @click="removeTask">
             <Trash2 :size="14" />删除节点
@@ -4732,7 +5573,11 @@ function chooseStructure(kind) {
               {{
                 selectedEdge.edgeType === "dependency"
                   ? "变量依赖（dependency）"
-                  : "Agent 关系（assignment / member）"
+                  : selectedEdge.edgeType === "route"
+                    ? `条件分支（${routerBranchLabel(workflow.tasks.find(item => item.id === selectedEdge.source), selectedEdge.branch)}）`
+                    : selectedEdge.edgeType === "router-condition"
+                      ? "条件变量依赖"
+                    : "Agent 关系（assignment / member）"
               }}
             </h3>
             <div class="connection-endpoint">
@@ -4741,69 +5586,19 @@ function chooseStructure(kind) {
                 taskName(selectedEdge.target)
               }}</span>
             </div>
-            <template v-if="selectedEdge.edgeType === 'dependency'"
-              ><div
-                class="variable-mapping-row"
-                v-for="(mapping, index) in workflow.tasks.find(
-                  (item) => item.id === selectedEdge.target,
-                ).dependency_variables[selectedEdge.source]"
-                :key="index"
-              >
-                <select
-                  v-model="mapping.source_variable"
-                  aria-label="上游输出变量（source_variable）"
-                >
-                  <option value="$raw">完整输出（$raw）</option>
-                  <option
-                    v-for="field in outputOptions(selectedEdge.source)"
-                    :key="field.name"
-                    :value="field.name"
-                  >
-                    {{ field.name }}
-                  </option></select
-                ><span>→</span
-                ><input
-                  v-model="mapping.target_variable"
-                  aria-label="下游变量（target_variable）"
-                /><button
-                  class="icon-button"
-                  title="删除变量映射"
-                  @click="
-                    removeVariableMapping(
-                      workflow.tasks.find(
-                        (item) => item.id === selectedEdge.target,
-                      ),
-                      selectedEdge.source,
-                      index,
-                    )
-                  "
-                >
-                  <Trash2 :size="12" />
-                </button>
-              </div>
-              <button
-                class="button small"
-                @click="
-                  addVariableMapping(
-                    workflow.tasks.find(
-                      (item) => item.id === selectedEdge.target,
-                    ),
-                    selectedEdge.source,
-                  )
-                "
-              >
-                <Plus :size="12" />添加字段映射
-              </button></template
-            >
             <p>
               {{
                 selectedEdge.edgeType === "dependency"
-                  ? "上游输出字段会在运行时提取，并绑定到下游 {变量名}。"
-                  : "上、下端口对应 Agent 分配或 Crew 成员关系。"
+                  ? "该连线建立执行顺序；目标节点可以引用这条上游路径中所有节点的固定输出变量。"
+              : selectedEdge.edgeType === "route"
+                ? "该节点只会在条件路由命中此分支时执行；未命中的分支及其独占下游会被跳过。"
+                : selectedEdge.edgeType === "router-condition"
+                  ? selectedEdge.label
+                : "上、下端口对应 Agent 分配或 Crew 成员关系。"
               }}
             </p>
           </section>
-          <button class="button danger" @click="removeEdge">
+          <button v-if="selectedEdge.edgeType !== 'router-condition'" class="button danger" @click="removeEdge">
             <Trash2 :size="14" />删除关系
           </button>
         </div>
@@ -4831,10 +5626,11 @@ function chooseStructure(kind) {
                 v-model="input.label"
                 aria-label="显示名称（label）"
               /><input
-                v-model="input.name"
+                :value="input.name"
                 aria-label="变量名（name）"
                 :disabled="input.name === 'message'"
-              /><select v-model="input.input_type" :disabled="input.name === 'message'">
+                @change="renameWorkflowInput(input, $event)"
+              /><select :value="input.input_type" @change="changeWorkflowInputType(input, $event.target.value)">
                 <option value="text">短文本（text）</option>
                 <option value="long_text">长文本（long_text）</option>
                 <option value="file">文件（file）</option>
@@ -4852,7 +5648,7 @@ function chooseStructure(kind) {
                 v-if="input.name !== 'message'"
                 class="icon-button"
                 title="删除运行输入"
-                @click="workflow.inputs.splice(index, 1)"
+                @click="removeWorkflowInput(input, index)"
               >
                 <Trash2 :size="12" />
               </button>
@@ -4872,108 +5668,22 @@ function chooseStructure(kind) {
               <small class="field-help-text">
               </small>
             </div>
+            <p v-if="workflow.interaction_mode === 'multi_turn'" class="field-help-text">
+              可为多个普通 Agent 或 Flow Crew 中的 Agent 开启 ask_user。执行到相应节点时暂停，用户回复后从该节点的检查点恢复；无需指定单一信息收集节点。
+            </p>
           </section>
           <section
             v-if="workflow.kind === 'crew'"
             class="inspector-section crew-settings"
           >
-            <h3><Settings2 :size="13" />Crew 设置（Crew）</h3>
-            <div class="field">
-              <label
-                ><ParamLabel
-                  text="执行模式（process）"
-                  help="sequential 按依赖顺序执行；hierarchical 由管理 Agent 分配任务。" /></label
-              ><select
-                :value="workflow.process"
-                @change="changeProcess($event.target.value)"
-              >
-                <option value="sequential">顺序（sequential）</option>
-                <option value="hierarchical">层级（hierarchical）</option>
-              </select>
-            </div>
-            <template v-if="workflow.process === 'hierarchical'"
-              ><div class="field">
-                <label>管理 Agent（manager_agent）</label
-                ><select
-                  :value="workflow.manager_agent_id || ''"
-                  @change="setManager($event.target.value)"
-                >
-                  <option value="">CrewAI 自动管理（manager_llm）</option>
-                  <option
-                    v-for="agent in workflow.agents"
-                    :key="agent.id"
-                    :value="agent.id"
-                  >
-                    {{ agent.role }}
-                  </option>
-                </select>
-              </div>
-              <div v-if="!workflow.manager_agent_id" class="field">
-                <label>管理模型（manager_llm）</label
-                ><select v-model="workflow.manager_model_profile_id">
-                  <option :value="null">工作流默认（workflow_default）</option>
-                  <option
-                    v-for="model in store.chatModels"
-                    :key="model.id"
-                    :value="model.id"
-                  >
-                    {{ model.name }}
-                  </option>
-                </select>
-              </div></template
-            ><label class="toggle-row"
-              ><span
-                >执行规划（planning）<button
-                  class="field-help"
-                  type="button"
-                  title="Crew 级任务规划，适合需要动态拆解的多步骤目标。单步规则任务请关闭，避免额外规划和重复反思。"
-                  aria-label="执行规划帮助"
-                >
-                  <CircleHelp :size="12" /></button></span
-              ><input
-                v-model="workflow.planning"
-                type="checkbox"
-                class="toggle"
-            /></label>
-            <div v-if="workflow.planning" class="field">
-              <label>规划模型（planning_llm）</label
-              ><select v-model="workflow.planning_model_profile_id">
-                <option :value="null">工作流默认（workflow_default）</option>
-                <option
-                  v-for="model in store.chatModels"
-                  :key="model.id"
-                  :value="model.id"
-                >
-                  {{ model.name }}
-                </option>
-              </select>
-            </div>
-            <label class="toggle-row"
-              ><span>记忆（memory）</span
-              ><input
-                v-model="workflow.memory"
-                type="checkbox"
-                class="toggle" /></label
-            ><label class="toggle-row"
-              ><span>工具缓存（cache）</span
-              ><input v-model="workflow.cache" type="checkbox" class="toggle"
-            /></label>
-            <div class="field">
-              <label>每分钟最大请求数（max_rpm）</label
-              ><input
-                v-model.number="workflow.max_rpm"
-                type="number"
-                min="1"
-                placeholder="不限制"
-              />
-            </div>
-            <div class="field">
-              <label>执行日志文件（output_log_file）</label
-              ><input
-                v-model="workflow.output_log_file"
-                placeholder="logs/crew.json"
-              />
-            </div>
+            <CrewSettingsEditor
+              :model-value="workflow"
+              :agents="workflow.agents"
+              :models="store.chatModels"
+              title="Crew 设置"
+              @process-change="changeProcess($event)"
+              @manager-change="setManager($event)"
+            />
           </section>
           <section v-else class="inspector-section crew-settings">
             <h3><Settings2 :size="13" />Flow 设置（Flow）</h3>
@@ -4990,84 +5700,9 @@ function chooseStructure(kind) {
               />
             </div>
           </section>
-          <div class="resource-group">
-            <div class="resource-group-title">
-              <span>Agent 定义（agents）</span
-              ><span>{{ workflow.agents.length }}</span>
-            </div>
-            <button
-              v-for="agent in workflow.agents"
-              :key="agent.id"
-              class="resource-item palette-item"
-              @click="selectedAgentId = agent.id"
-            >
-              <span><Bot :size="13" /></span>
-              <div>
-                <strong>{{ agent.role }}</strong
-                ><small>Agent（role, goal, tools, skills）</small>
-              </div></button
-            ><button
-              class="button small"
-              @click="addAgent"
-            >
-              <Plus :size="13" />新增 Agent
-            </button>
-          </div>
-          <div class="resource-group">
-            <div class="resource-group-title">
-              <span>{{
-                workflow.kind === "crew" ? "Crew 任务" : "Flow 执行节点"
-              }}</span
-              ><Plus :size="12" />
-            </div>
-            <button
-              v-if="workflow.kind === 'crew'"
-              class="resource-item palette-item"
-              @click="addStep('task')"
-            >
-              <span><ListTodo :size="13" /></span>
-              <div>
-                <strong>Crew 任务（task）</strong
-                ><small>Task(description, agent, context)</small>
-              </div></button
-            ><template
-              ><button
-                class="resource-item palette-item"
-                title="只需要一个角色完成该步骤时使用，直接调用 Agent.kickoff；不必为了单步工作创建 Crew。"
-                @click="addStep('agent')"
-              >
-                <span><Bot :size="13" /></span>
-                <div>
-                  <strong>单 Agent 调用（agent_call）</strong
-                  ><small>Agent.kickoff(...)</small>
-                </div>
-                <CircleHelp :size="12" /></button
-              ><button
-                class="resource-item palette-item"
-                title="需要多个 Agent 按明确任务协作时使用；节点内部可配置 Crew Task。"
-                @click="addStep('crew')"
-              >
-                <span><UsersRound :size="13" /></span>
-                <div>
-                  <strong>Crew 协作（crew）</strong
-                  ><small>Crew(tasks=[...]).kickoff(...)</small>
-                </div>
-                <CircleHelp :size="12" /></button
-              ><button
-                class="resource-item palette-item"
-                @click="addStep('router')"
-              >
-                <span><Route :size="13" /></span>
-                <div>
-                  <strong>条件路由（router）</strong
-                  ><small>Flow router outcome</small>
-                </div>
-              </button></template
-            >
-          </div>
           <div class="canvas-help">
-            <MousePointer2 :size="13" />
-            <p>左右端口传递任务上下文；Agent 从下方连接到任务上方。</p>
+            <Plus :size="13" />
+            <p>添加节点请点击画布左上角的 ＋；左右端口传递任务上下文，Flow 中 Agent 只能通过下方到任务顶部的连线指定。</p>
           </div>
         </div>
       </aside>
@@ -5085,7 +5720,7 @@ function chooseStructure(kind) {
           <X :size="15" />
         </button>
       </header>
-      <div ref="previewThread" class="studio-preview-thread">
+      <div ref="previewThread" class="studio-preview-thread" @scroll="onPreviewScroll">
         <article
           v-for="(message, index) in previewMessages"
           :key="index"
@@ -5101,54 +5736,22 @@ function chooseStructure(kind) {
                 ><FileText :size="11" />{{ file.name }}</span
               >
             </div>
-            <div v-if="message.steps?.length" class="run-activity">
-              <header>
-                <GitBranch :size="12" /><strong>执行进度</strong
-                ><span
-                  >{{
-                    message.steps.filter((item) => item.status === "completed")
-                      .length
-                  }}/{{ message.steps.length }}</span
-                >
-              </header>
-              <ol>
-                <li
-                  v-for="step in message.steps"
-                  :key="step.step_id"
-                  :class="[step.status, { expanded: step.expanded }]"
-                >
-                  <i></i>
-                  <div>
-                    <div class="run-step-heading">
-                      <strong>{{ step.agent_role }}</strong
-                      ><button
-                        v-if="step.output"
-                        class="run-step-toggle"
-                        type="button"
-                        :title="
-                          step.expanded ? '收起智能体输出' : '展开智能体输出'
-                        "
-                        :aria-label="
-                          step.expanded ? '收起智能体输出' : '展开智能体输出'
-                        "
-                        :aria-expanded="step.expanded"
-                        @click="step.expanded = !step.expanded"
-                      >
-                        <ChevronDown :size="13" />
-                      </button>
-                    </div>
-                    <small
-                      >{{ step.step_name
-                      }}<template v-if="step.tool_name">
-                        · {{ step.tool_name }}</template
-                      ></small
-                    >
-                    <p v-if="step.preview" :class="{ expanded: step.expanded }">
-                      {{ step.expanded ? step.output : step.preview }}
-                    </p>
-                  </div>
-                </li>
-              </ol>
+            <div v-if="message.turns?.length" class="agent-turn-list preview-turn-list">
+                <article v-for="turn in message.turns" :key="turn.id" class="agent-turn" :class="[turn.status, { collapsed: !turn.expanded }]">
+                <button class="agent-turn-head" type="button" @click="turn.expanded = !turn.expanded">
+                  <span class="agent-turn-dot" :class="turn.status"></span>
+                  <span class="agent-turn-title"><strong>{{ turn.agent_role }}</strong><small>{{ turn.step_name }}</small></span>
+                  <span class="agent-turn-state">{{ turn.status === 'running' ? '运行中' : turn.status === 'failed' ? '失败' : turn.status === 'waiting_input' ? '等待输入' : '已完成' }}</span>
+                  <ChevronDown :size="13" />
+                </button>
+                <div v-if="turn.expanded" class="agent-turn-body">
+                  <div v-if="turn.activity" class="agent-turn-activity"><span class="activity-pulse-dot"></span>{{ turn.activity }}</div>
+                  <div v-if="turn.tools?.length" class="agent-turn-tools"><div v-for="tool in turn.tools" :key="tool.id" class="agent-turn-tool" :class="tool.status"><LoaderCircle v-if="tool.status === 'running'" class="spin" :size="11" /><Check v-else-if="tool.status === 'completed'" :size="11" /><X v-else :size="11" /><span><strong>{{ tool.name }}</strong><small>{{ tool.detail }}</small></span></div></div>
+                  <RichMessage v-if="turn.output && turn.status !== 'running'" class="agent-turn-output agent-turn-rich-output" :text="turn.output" />
+                  <pre v-else-if="turn.output" class="agent-turn-output">{{ turn.output }}</pre>
+                  <span v-if="turn.status === 'running'" class="stream-caret"></span>
+                </div>
+              </article>
             </div>
             <RunApprovalCard
               v-for="approval in message.approvals || []"
@@ -5158,7 +5761,11 @@ function chooseStructure(kind) {
               @submit="submitPreviewFeedback(message, approval, $event)"
             />
             <div v-if="message.runtimeNotice" class="run-runtime-notice">
-              {{ message.runtimeNotice }}
+              <span>{{ message.runtimeNotice }}</span>
+              <small v-if="message.retryHistory?.length">已自动恢复 {{ message.retryHistory.length }} 次</small>
+            </div>
+            <div v-if="message.activity && !message.turns?.length" class="run-current-activity">
+              <span class="activity-pulse-dot"></span>{{ message.activity }}
             </div>
             <div
               v-if="message.streaming && !message.text"
@@ -5178,7 +5785,40 @@ function chooseStructure(kind) {
             </div>
             <div v-if="message.error" class="chat-run-error">
               {{ message.error }}
+              <button
+                v-if="message.jobId && !message.streaming"
+                class="button ghost chat-retry chat-error-retry"
+                type="button"
+                :disabled="busy || message.retrying"
+                @click="retryStudioMessage(message)"
+              >
+                <LoaderCircle v-if="message.retrying" class="spin" :size="13" />
+                <RotateCcw v-else :size="13" />
+                {{ message.retrying ? "正在重试…" : "重试此轮" }}
+              </button>
             </div>
+            <button
+              v-if="isLatestRunMessage(previewMessages, message) && !message.streaming && ['completed', 'failed', 'waiting_input'].includes(message.status)"
+              class="button ghost chat-retry"
+              type="button"
+              :disabled="previewBusy || message.retrying"
+              @click="retryPreviewMessage(message)"
+            >
+              <LoaderCircle v-if="message.retrying" class="spin" :size="13" />
+              <RotateCcw v-else :size="13" />
+              {{ message.retrying ? "正在重试…" : "重试此轮" }}
+            </button>
+            <button
+              v-if="message.jobId && !message.streaming && (message.status === 'failed' || message.error)"
+              class="button ghost chat-retry"
+              type="button"
+              :disabled="busy || message.retrying"
+              @click="retryStudioMessage(message)"
+            >
+              <LoaderCircle v-if="message.retrying" class="spin" :size="13" />
+              <RotateCcw v-else :size="13" />
+              {{ message.retrying ? "正在重试…" : "重试此轮" }}
+            </button>
             <span
               v-if="message.streaming && message.text"
               class="stream-caret"
